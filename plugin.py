@@ -1,4 +1,4 @@
-"""IMDb Titles: renames VOD movies and series to their official titles.
+"""Clean Titles: renames VOD movies and series to their official titles.
 
 Each Movie/Series with a TMDB ID is looked up on TMDB (one request per title,
 which also returns the IMDb ID) and renamed to the official title in the chosen
@@ -32,7 +32,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "plugin.json"), encoding="utf-8") as _f:
     _MANIFEST = json.load(_f)
 
-LOGGER_NAME = "apps.plugins.imdb_titles"  # under "apps" so it follows Dispatcharr's LOG_LEVEL
+LOGGER_NAME = "apps.plugins.clean_titles"  # under "apps" so it follows Dispatcharr's LOG_LEVEL
+# Keeps its old name: renamed titles already store their originals under this key,
+# so changing it would break Revert All Renames.
 MARK = "imdb_titles"                      # custom_properties key holding the original name
 TMDB = "https://api.themoviedb.org/3"
 
@@ -154,7 +156,7 @@ class Plugin:
                 if action_id == "tag_duplicates":
                     dry = bool(settings.get("dry_run", True))
                     summary = self._describe_tags(self._tag_duplicates(dry), dry)
-                    self._notify(summary, False, title="IMDb Titles: duplicates tagged" if not dry else "IMDb Titles: duplicate tags (dry run)")
+                    self._notify(summary, False, title="Clean Titles: duplicates tagged" if not dry else "Clean Titles: duplicate tags (dry run)")
                     return {"status": "ok", "message": summary}
                 if action_id == "unify_series":
                     return self._unify_series(settings)
@@ -678,7 +680,7 @@ class Plugin:
         summary = self._describe(st)
         log.info("Image fix finished: %s", summary.replace("\n", " | "))
         if notify:
-            self._notify(summary, False, title="IMDb Titles: images fixed" if not dry else "IMDb Titles: image fix (dry run)")
+            self._notify(summary, False, title="Clean Titles: images fixed" if not dry else "Clean Titles: image fix (dry run)")
         return {"status": "ok", "message": summary}
 
     @staticmethod
@@ -795,7 +797,7 @@ class Plugin:
                     self.state.write(st)
         finally:
             _release_db_connections()
-        return self._finish(st, log, "Unify", "IMDb Titles: series unified" if not dry else "IMDb Titles: unify (dry run)")
+        return self._finish(st, log, "Unify", "Clean Titles: series unified" if not dry else "Clean Titles: unify (dry run)")
 
     def _revert_unify(self):
         import logging
@@ -855,7 +857,7 @@ class Plugin:
                     self.state.write(st)
         finally:
             _release_db_connections()
-        return self._finish(st, log, "Revert unify", "IMDb Titles: unify reverted")
+        return self._finish(st, log, "Revert unify", "Clean Titles: unify reverted")
 
     def _finish(self, st, log, label, title):
         st["running"] = False
@@ -1413,7 +1415,7 @@ class Plugin:
         log.info("Category groups finished: %s", summary.replace("\n", " | "))
         if notify:
             self._notify(summary, bool(st.get("failed")),
-                         title="IMDb Titles: categories grouped" if not dry else "IMDb Titles: category groups (dry run)")
+                         title="Clean Titles: categories grouped" if not dry else "Clean Titles: category groups (dry run)")
         return {"status": "ok", "message": summary}
 
     def _revert_groups(self):
@@ -1460,7 +1462,7 @@ class Plugin:
             st["failed"] = str(exc)
         finally:
             _release_db_connections()
-        return self._finish(st, log, "Revert category groups", "IMDb Titles: category groups reverted")
+        return self._finish(st, log, "Revert category groups", "Clean Titles: category groups reverted")
 
     # --- revert -----------------------------------------------------------------
 
@@ -1503,7 +1505,7 @@ class Plugin:
         self.state.write(st)
         summary = self._describe(st)
         log.info("Revert finished: %s", summary.replace("\n", " | "))
-        self._notify(summary, False, title="IMDb Titles: revert done")
+        self._notify(summary, False, title="Clean Titles: revert done")
         return {"status": "ok", "message": summary}
 
     # --- reporting ----------------------------------------------------------------
@@ -1613,7 +1615,7 @@ class Plugin:
                 notification_key=f"{prefix}{int(time.time())}",
                 notification_type=kind.WARNING if warning else kind.INFO,
                 priority=SystemNotification.Priority.HIGH,
-                title=title or f"IMDb Titles: run {'stopped' if warning else 'done'}",
+                title=title or f"Clean Titles: run {'stopped' if warning else 'done'}",
                 message=message,
                 is_active=True,
                 admin_only=True,

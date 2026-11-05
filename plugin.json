@@ -1,0 +1,247 @@
+{
+  "name": "IMDb Titles",
+  "version": "1.15.0",
+  "description": "Renames VOD movies and series in the catalogue to their official titles (the same titles IMDb lists), looked up by each title's TMDB ID. Removes provider prefixes and tags like 'EN - ... (US)'. Keeps each original name so every rename can be reverted. Can also merge the providers' many categories into fewer shared ones (Netflix, Disney+, Action & Adventure...). Dry run by default.",
+  "author": "brxdy",
+  "license": "MIT",
+  "repo_url": "https://github.com/Brxdy22/Dispatcharr-IMDb-Titles-Plugin",
+  "fields": [
+    {
+      "id": "tmdb_api_key",
+      "label": "TMDB API key",
+      "type": "string",
+      "default": "",
+      "help_text": "Free key from themoviedb.org (Settings > API). Either the short 'API Key' or the long 'API Read Access Token' works."
+    },
+    {
+      "id": "dry_run",
+      "label": "Dry run (look up, but rename nothing)",
+      "type": "boolean",
+      "default": true,
+      "help_text": "ON: looks titles up and reports what it would rename, writes nothing. OFF: renames."
+    },
+    {
+      "id": "scope",
+      "label": "What to rename",
+      "type": "select",
+      "default": "both",
+      "options": [
+        {
+          "value": "both",
+          "label": "Movies and series"
+        },
+        {
+          "value": "movies",
+          "label": "Movies only"
+        },
+        {
+          "value": "series",
+          "label": "Series only"
+        }
+      ]
+    },
+    {
+      "id": "name_format",
+      "label": "Name format",
+      "type": "select",
+      "default": "title",
+      "options": [
+        {
+          "value": "title",
+          "label": "Title  (e.g. Dexter: Resurrection)"
+        },
+        {
+          "value": "title_year",
+          "label": "Title (Year)  (e.g. Dexter: Resurrection (2025))"
+        }
+      ],
+      "help_text": "Dispatcharr shows the year separately, so plain Title is usually best."
+    },
+    {
+      "id": "language",
+      "label": "Title language",
+      "type": "string",
+      "default": "en-US",
+      "help_text": "TMDB language code for the title, e.g. en-US. IMDb's main titles are English."
+    },
+    {
+      "id": "requests_per_second",
+      "label": "Max TMDB lookups per second",
+      "type": "number",
+      "default": 20,
+      "min": 1,
+      "help_text": "TMDB allows about 40-50 per second. 20 renames ~30,000 titles in under half an hour."
+    },
+    {
+      "id": "category_groups",
+      "label": "Category groups",
+      "type": "text",
+      "default": "# One group per line: Group name = provider category, provider category, ...\n# Case and spacing don't matter, 4K superscripts read as plain text, * matches anything.\n# The first line that matches a category wins. Unlisted categories stay as they are.\n# Empty the box to turn grouping off (then press Revert Category Groups).\n\n[movies]\nNetflix Kids = NETFLIX KIDS*\nNetflix = NETFLIX MOVIES*, |EN| NETFLIX, 4K NETFLIX MOVIES, NETFLIX HEVC, NETFLIX ASIA\nPrime Video Kids = AMAZON KIDS*\nPrime Video = AMAZON MOVIES*, |EN| PRIME+\nDisney+ Kids = DISNEY+ KIDS*, |EN| PIXAR MOVIES\nDisney+ = DISNEY+ MOVIES*, |EN| DISNEY+, MARVEL MOVIES*, |EN| MARVEL UNIVERSE\nApple TV+ Kids = APPLE+ KIDS*\nApple TV+ = APPLE+ MOVIES*\nHBO Max = |EN| HBO MAX\nHulu = |EN| HULU\nNew Releases = EN - NEW RELEASE, |EN| NEW RELEASED, |EN| PRE-RELEASES*\nMovie Library = EN - 2020 & OLD, |EN| MOVIES 2018-2021, TOP MOVIES BLURAY*, |EN| TV MOVIES, |EN| UK MOVIES, |EN| BET/ALLBLK MOVIES, UNIVERSAL, PARAMOUNT PICTURES, DISCOVERY+ MOVIES, OSN+ MOVIES*\n4K Movies = EN - MOVIES 4K*, |EN| 4K MOVIES, TOP MOVIES 4K*\nAction & Adventure = EN - ACTION, |EN| ACTION/THRILLER, EN - ADVENTURE, |EN| ADVENTURE MOVIES, |EN| WAR\nCrime & Gangster = |EN| DRAMA/CRIME, |EN| GANGSTER & MAFIA, |EN| 4K MAFIA & GANGSTER\nComedy & Stand-Up = EN - COMEDY, |EN| COMEDY, NETFLIX STAND-UP COMEDY, DISNEY+ STAND-UP COMEDY, |EN| STAND-UP COMEDY\nDrama & Romance = EN - DRAMA, |EN| DRAMA, |EN| DRAMA/COMEDY, |EN| DRAMA/ROMANCE, EN - ROMANCE\nHorror & Thriller = EN - HORROR, |EN| HORROR/THRILLER, EN - THRILLER\nSci-Fi & Fantasy = EN - SCIENCE FICTION, |EN| SCIENCE FICTION/FANTASTY\nClassics & Westerns = EN - WESTERNS, |EN| WESTERNS, |EN| CLASSIC MOVIES COLLECTION, |EN| 4K CLASSIC MOVIES\nHoliday & Hallmark = EN - CHRISTMAS, |EN| CHRISTMAS MOVIES, |EN| HALLMARK MOVIES\nCollections = EN - COLLECTIONS, |EN| COLLECTIONS, |EN| ACTORS & DIRECTORS\nDocumentaries = EN - DOCUMENTARIES, |EN| DOCUMENTARY, |EN| 4K DOCUMENTARY*, NETFLIX DOCU-MOVIES, AMAZON DOCU-MOVIES*, DISNEY+ DOCU-MOVIES*\nKids & Family = EN - KIDS*, EN - FAMILY, TOP KIDS BLURAY*, |EN| CHILDREN/FAMILY, |EN| 4K CHILDREN\nAnime & Animation = EN - MANGA/ANIME, |EN| ANIME, NETFLIX ANIMI, DREAMWORKS ANIMATION, |EN| CLASSIC CARTOONS\nMusic & Musicals = EN - CONCERTS, |EN| MUSIC/CONCERTS, EN - MUSICAL, |EN| BROADWAY/MUSICAL, NETFLIX MUSIC\nFaith = EN - BIBLICAL, CHRISTIAN MOVIES, |EN| BIBLICAL/RELIGIOUS\nSports & Fitness = EN - BOXING, EN - UFC, EN - WWE, EN - WORKOUT\nTop Rated = EN - IMDB TOP 250, TOP IMDB/OSCAR MOVIES\nWorld Cinema = |EN| FOREIGN MOVIES, |EN| FRENCH MOVIES*, EN - ITALIAN SUB ENG, |EN| ITALIAN MOVIES*\n\n[series]\nNetflix Kids = NETFLIX KIDS*, |MULTI| NETFLIX KIDS\nNetflix = NETFLIX SERIES*, |MULTI| NETFLIX SERIES*, |EN| NETFLIX\nPrime Video Kids = AMAZON KIDS*\nPrime Video = AMAZON SERIES*, |EN| AMAZON PRIME\nDisney+ Kids = DISNEY+ KIDS*, |MULTI| DISNEY+ KIDS, |EN| DISNEY+ ANIMATION\nDisney+ = DISNEY+ SERIES*, |EN| DISNEY+ SERIES, |MULTI| DISNEY+ SERIES, MARVEL SERIES*\nApple TV+ Kids = APPLE+ KIDS*, |MULTI| APPLE+ KIDS\nApple TV+ = APPLE+ SERIES*, |EN| APPLE TV+, |MULTI| APPLE+ SERIES\nHBO Max = HBO MAX SERIES*, |EN| HBO MAX\nHulu = |EN| HULU/FX/FOX/ABC\nParamount+ = PARAMOUNT+, |EN| CBS/PARAMOUNT+\nPeacock = PEACOCK, |EN| NBC/PEACOCK\nPremium Cable = SHOWTIME, |EN| SHOWTIME/STARZ, |EN| AMC+/MGM+, OSN+ SERIES*\nDiscovery+ = DISCOVERY+ SERIES\nLatest Releases = |EN| LATEST RELEASES\n4K Series = ENGLISH SERIES 4K*, |EN| 4K SERIES\nEnglish Series = ENGLISH SERIES, ENGLISH SERIES DOLBY*, ENGLISH SERIES (TR), |EN| ENGLISH SERIES, |EN| TOP SERIES, |EN| CLASSIC SERIES, |EN| UK SERIES, |EN| GANGSTER & MAFIA, |EN| HALLMARK SERIES\nComedy & Stand-Up = |EN| COMEDY SERIES, NETFLIX STAND-UP COMEDY\nKids = ENGLISH KIDS, |EN| ENGLISH KIDS, NICKELODEON, |EN| CLASSIC CARTOONS\nReality = NETFLIX REALITY, AMAZON REALITY*, DISNEY+ REALITY, ENGLISH REALITY SERIES, |EN| REALITY SHOWS\nDocumentaries = NETFLIX DOCU-SERIES, AMAZON DOCU-SERIES*, APPLE+ DOCU-SERIES*, DISNEY+ DOCU-SERIES*, HBO MAX DOCU-SERIES, |EN| DOCUMENTARIES\nAnime & Animation = |EN| ANIME, NETFLIX ANIME, CRUNCHYROLL*, HBO MAX (ADULT SWIM), NETFLIX ADULT-SWIM\nPodcasts = NETFLIX PODCAST, DISNEY+ PODCAST, HBO MAX PODCAST\nWorld Series = |EN| ASIAN SERIES, |EN| TURKISH SERIES SUB\nBET/ALLBLK = |EN| BET/ALLBLK SERIES\n",
+      "help_text": "Combines provider categories into one shared category per line: 'Group name = category, category'. Case and spacing don't matter, 4K superscripts read as plain text, * matches anything, and the first matching line wins. Categories not listed stay as they are. Applied with Apply Category Groups and after every VOD scan. Empty the box to stop grouping."
+    },
+    {
+      "id": "sort_by_platform",
+      "label": "File genre titles under their streaming service",
+      "type": "boolean",
+      "default": true,
+      "help_text": "ON: titles in genre and catch-all groups (Action, New Releases, English Series, 4K...) move to the service that streams them, e.g. Dexter: Resurrection to Paramount+. A provider's own service category wins, else TMDB's US 'where to watch' (a series' original network first). Titles on no subscription service stay in their genre. Kids titles go to the service's Kids group."
+    },
+    {
+      "id": "platform_order",
+      "label": "Streaming service order",
+      "type": "string",
+      "default": "Netflix, Disney+, Prime Video, HBO Max, Hulu, Apple TV+, Paramount+, Peacock, Discovery+, Starz, AMC+, MGM+",
+      "help_text": "When a title streams on several services, the first one listed wins. Starz, AMC+ and MGM+ are last resorts: they only win when none of the others streams the title, even for their own originals. Services not listed are ignored."
+    },
+    {
+      "id": "extra_service_min_titles",
+      "label": "Minimum titles for other services",
+      "type": "number",
+      "default": 25,
+      "min": 1,
+      "help_text": "Services TMDB lists that aren't in the order above (Tubi, Pluto TV, BritBox, Crunchyroll, Hallmark+...) get their own category when at least this many titles end up there; smaller ones stay in Uncategorized. They rank below the services in the order, biggest first (paid and free alike), so YouTube or The Roku Channel beat a small channel like Howdy. Add one to the order to rank it higher. Live-TV bundles and cable-login apps (fuboTV, Philo, YouTube TV, TBS...) are skipped."
+    },
+    {
+      "id": "platform_region",
+      "label": "Streaming region",
+      "type": "string",
+      "default": "US",
+      "help_text": "Country whose streaming services count (two-letter code)."
+    },
+    {
+      "id": "theaters_group",
+      "label": "Movies in theaters go to",
+      "type": "string",
+      "default": "In Theaters",
+      "help_text": "Genre/catch-all movies on no streaming service that TMDB lists as now playing in cinemas (in the streaming region) go to this category. Empty: off."
+    },
+    {
+      "id": "unmatched_group",
+      "label": "Titles on no streaming service go to",
+      "type": "string",
+      "default": "Uncategorized",
+      "help_text": "Genre/catch-all titles that are on none of the streaming services (or not on TMDB) go to this category, so the genre groups empty out. Empty: they stay in their genre group."
+    }
+  ],
+  "actions": [
+    {
+      "id": "rename_run",
+      "label": "Rename Run",
+      "description": "Starts a background run over every movie/series with a TMDB ID that hasn't been renamed yet. With Dry run on, only reports. Also runs after each M3U refresh, but only for accounts with Enable VOD Scanning on: it waits for that account's VOD scan to finish, then fixes posters and renames that account's new titles. Follow it with Status.",
+      "button_label": "Run",
+      "button_variant": "filled",
+      "button_color": "green",
+      "events": [
+        "m3u_refresh"
+      ],
+      "async": true
+    },
+    {
+      "id": "status",
+      "label": "Status",
+      "description": "Progress of the current run, or the result of the last one.",
+      "button_label": "Status",
+      "button_variant": "outline",
+      "button_color": "blue"
+    },
+    {
+      "id": "stop_run",
+      "label": "Stop Run",
+      "description": "Stops the current run after the title in progress.",
+      "button_label": "Stop",
+      "button_variant": "outline",
+      "button_color": "orange"
+    },
+    {
+      "id": "tag_duplicates",
+      "label": "Tag Duplicates",
+      "description": "Titles that exist twice (same TMDB ID, split by provider category) get a short provider tag so you can tell them apart, e.g. 'Zero Day [EN]' / 'Zero Day [NF]'. 4K is left out of the tag ('4K-D+' -> 'D+') unless both '4K-D+' and 'D+' exist. Runs automatically at the end of every real Rename Run. Honors Dry run.",
+      "button_label": "Tag",
+      "button_variant": "outline",
+      "button_color": "blue",
+      "async": true
+    },
+    {
+      "id": "unify_series",
+      "label": "Unify Series",
+      "description": "Shows each series once: folds the copies Dispatcharr keeps apart (older shows carry a legacy empty language, so a second provider's copy of the same show becomes a separate entry) into one show with every provider behind it. Playback follows M3U account priority, and Dispatcharr's player lets you pick the provider. New episodes and new providers join automatically afterwards. With Dry run on, only reports. Undo with Revert Unify.",
+      "button_label": "Unify Series",
+      "button_variant": "filled",
+      "button_color": "blue",
+      "async": true,
+      "confirm": {
+        "required": true,
+        "title": "Unify series?",
+        "message": "Copies of the same show from different providers become one show. Dry run only reports. Revert Unify splits them again."
+      }
+    },
+    {
+      "id": "fix_images",
+      "label": "Fix Images",
+      "description": "Finds titles whose poster points at an image server that isn't answering (or that have no poster) and gives them the TMDB poster instead. Only the poster changes. Also runs after each M3U refresh of an account with Enable VOD Scanning on, because a refresh points them back at the provider's image. With Dry run on, only reports.",
+      "button_label": "Fix Images",
+      "button_variant": "filled",
+      "button_color": "teal",
+      "async": true
+    },
+    {
+      "id": "group_categories",
+      "label": "Apply Category Groups",
+      "description": "Moves titles from the provider categories listed in Category groups into the shared categories (for example every Netflix movie category into 'Netflix'), for both providers, and files genre titles under their streaming service when that setting is on. Only the category a title is listed under changes, never its streams. Also runs after each VOD scan, because a scan puts titles back in the provider's categories. The first run looks up every title's streaming service on TMDB (a few minutes); later runs only look up new titles. With Dry run on, only reports. Undo with Revert Category Groups.",
+      "button_label": "Apply Groups",
+      "button_variant": "filled",
+      "button_color": "grape",
+      "async": true
+    },
+    {
+      "id": "recheck_all",
+      "label": "Re-check Renamed Titles",
+      "description": "Makes the next Rename Run look up already-renamed titles again too (for example after changing the name format or language).",
+      "button_label": "Re-check",
+      "button_variant": "outline",
+      "button_color": "blue"
+    },
+    {
+      "id": "revert_unify",
+      "label": "Revert Unify",
+      "description": "Splits every series combined by Unify Series back into its separate copies. Renames stay. Runs in the background.",
+      "button_label": "Revert Unify",
+      "button_variant": "outline",
+      "button_color": "orange",
+      "async": true,
+      "confirm": {
+        "required": true,
+        "title": "Revert unify?",
+        "message": "Every unified series is split back into one entry per provider copy."
+      }
+    },
+    {
+      "id": "revert_groups",
+      "label": "Revert Category Groups",
+      "description": "Puts every grouped title back in its provider's own category and removes the shared categories. To keep it that way, also empty the Category groups box (otherwise the next VOD scan groups them again).",
+      "button_label": "Revert Groups",
+      "button_variant": "outline",
+      "button_color": "orange",
+      "async": true,
+      "confirm": {
+        "required": true,
+        "title": "Revert category groups?",
+        "message": "Every title goes back to its provider's own category."
+      }
+    },
+    {
+      "id": "revert_all",
+      "label": "Revert All Renames",
+      "description": "Puts every renamed title back to the provider's original name. Runs in the background.",
+      "button_label": "Revert",
+      "button_variant": "outline",
+      "button_color": "red",
+      "confirm": {
+        "required": true,
+        "title": "Revert every rename?",
+        "message": "All movies and series renamed by this plugin get their original provider names back."
+      },
+      "async": true
+    }
+  ]
+}

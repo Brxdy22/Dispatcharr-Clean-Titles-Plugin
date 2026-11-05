@@ -26,9 +26,13 @@ Or download `clean_titles-1.15.0.zip` from Releases and import it on the Plugins
 
 ## Credits
 
+<img src="tmdb-logo.svg" alt="TMDB" width="56">
+
 This product uses the [TMDB](https://www.themoviedb.org) API but is not endorsed or certified by TMDB.
 
 This plugin is not affiliated with or endorsed by IMDb.
+
+The TMDB logo belongs to TMDB and is not covered by this repository's MIT licence.
 
 ## Licence
 

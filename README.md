@@ -8,6 +8,8 @@ Renames VOD movies and series to their official titles, looked up by each title'
 
 Copy this repository's files into `/data/plugins/imdb_titles` in your Dispatcharr data folder, then enable **IMDb Titles** on the Plugins page.
 
+Or download `imdb_titles-1.15.0.zip` from Releases and import it on the Plugins page. Use that zip rather than GitHub's source zip, because Dispatcharr names the plugin after the zip's top folder.
+
 ## Use
 
 1. Add a free [TMDB](https://www.themoviedb.org/settings/api) API key in the plugin settings.

@@ -2,7 +2,7 @@
   "name": "Clean Titles",
   "version": "1.15.0",
   "description": "Renames VOD movies and series in the catalogue to their official titles, looked up by each title's TMDB ID. Removes provider prefixes and tags like 'EN - ... (US)'. Keeps each original name so every rename can be reverted. Can also merge the providers' many categories into fewer shared ones (Netflix, Disney+, Action & Adventure...). Dry run by default. This product uses the TMDB API but is not endorsed or certified by TMDB.",
-  "author": "brxdy",
+  "author": "Brxdy22",
   "license": "MIT",
   "repo_url": "https://github.com/Brxdy22/Dispatcharr-Clean-Titles-Plugin",
   "fields": [

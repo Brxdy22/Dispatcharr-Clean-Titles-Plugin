@@ -182,6 +182,96 @@ class CategoryMap(unittest.TestCase):
         self.assertFalse(ids & {"category_groups", "sort_by_platform", "extra_service_min_titles"})
 
 
+class RentBuy(unittest.TestCase):
+    def test_setting_is_on_by_default(self):
+        self.assertEqual(p.Plugin._default("rent_buy_group"), "Rent/Buy")
+
+    def test_store_listings_never_pick_a_service(self):
+        self.assertEqual(p.Plugin()._pick_platform([], [], ["Prime Video"], []), "")
+
+    def test_only_store_listings_count(self):
+        only = p.Plugin._store_only
+        self.assertTrue(only(["", 0, [], [], [], ["Amazon Video"]]))
+        self.assertFalse(only(["", 0, [], ["Hoopla"], [], ["Amazon Video"]]))
+        self.assertFalse(only(["", 0, [], [], ["Tubi TV"], ["Amazon Video"]]))
+        self.assertFalse(only(["", 0, [], [], [], []]))
+        self.assertFalse(only(["", 0, [], [], []]))
+        self.assertFalse(only(None))
+
+    def test_watch_returns_rent_and_buy(self):
+        reply = mock.Mock(status_code=200)
+        reply.json.return_value = {"watch/providers": {"results": {"US": {
+            "rent": [{"provider_name": "Amazon Video"}], "buy": [{"provider_name": "Amazon Video"}, {"provider_name": "Fandango At Home"}]}}}}
+        session = mock.Mock()
+        session.get.return_value = reply
+        res = p.Plugin._watch(session, "k", "movie", 1, "US", mock.Mock())
+        self.assertEqual(res, ([], [], [], ["Amazon Video", "Fandango At Home"]))
+
+
+class Language(unittest.TestCase):
+    def verdict(self, info, keep_anime=True):
+        return p.Plugin._language_verdict(info, "en", keep_anime)
+
+    def test_original_or_spoken_english_stays(self):
+        self.assertEqual(self.verdict(["en", [], False, False]), "keep")
+        self.assertEqual(self.verdict(["de", ["de", "en"], False, False]), "keep")
+        self.assertEqual(self.verdict(["ko", ["en", "ko"], False, False]), "keep")  # Squid Game
+
+    def test_other_languages_go(self):
+        self.assertEqual(self.verdict(["fr", ["fr"], False, False]), "remove")
+
+    def test_unknown_always_stays(self):
+        for info in (None, ["", [], False, False], ["xx", [], False, False]):
+            self.assertEqual(self.verdict(info), "unknown")
+
+    def test_anime_stays_when_asked(self):
+        self.assertEqual(self.verdict(["ja", ["ja"], True, False]), "anime")
+        self.assertEqual(self.verdict(["zh", ["zh"], True, True]), "anime")
+        self.assertEqual(self.verdict(["ja", ["ja"], True, False], keep_anime=False), "remove")
+
+    def test_japanese_live_action_is_not_anime(self):
+        self.assertEqual(self.verdict(["ja", ["ja"], False, False]), "remove")
+
+    def test_korean_animation_off_crunchyroll_goes(self):
+        self.assertEqual(self.verdict(["ko", ["ko"], True, False]), "remove")
+
+    def test_anime_categories_match(self):
+        for name in ("EN - MANGA/ANIME", "|EN| ANIME", "NETFLIX ANIMI", "CRUNCHYROLL 4K", "Crunchyroll", "Anime & Animation"):
+            self.assertTrue(p.Plugin._ANIME_CATEGORY.search(name), name)
+        for name in ("DREAMWORKS ANIMATION", "Netflix", "|EN| CLASSIC CARTOONS"):
+            self.assertFalse(p.Plugin._ANIME_CATEGORY.search(name), name)
+
+    def test_filter_is_off_by_default(self):
+        self.assertIs(p.Plugin._default("language_filter"), False)
+
+    def test_language_info_reads_any_region(self):
+        reply = mock.Mock(status_code=200)
+        reply.json.return_value = {"original_language": "ja", "spoken_languages": [{"iso_639_1": "ja"}], "genres": [{"id": 16}],
+                                   "watch/providers": {"results": {"JP": {"link": "x", "flatrate": [{"provider_name": "Crunchyroll"}]}}}}
+        session = mock.Mock()
+        session.get.return_value = reply
+        self.assertEqual(p.Plugin._language_info(session, "k", "tv", 1, mock.Mock()), ["ja", ["ja"], True, True])
+
+    def test_missing_title_is_unknown(self):
+        session = mock.Mock()
+        session.get.return_value = mock.Mock(status_code=404)
+        info = p.Plugin._language_info(session, "k", "movie", "/1", mock.Mock())
+        self.assertEqual(self.verdict(info), "unknown")
+        self.assertTrue(session.get.call_args[0][0].endswith("/movie/1"))
+
+    def test_preview_button_needs_no_switch_but_remove_does(self):
+        plug = p.Plugin()
+        with tempfile.TemporaryDirectory() as folder:
+            plug.state.dir = folder
+            plug.state.status_path = os.path.join(folder, "status.json")
+            with mock.patch.object(p.Plugin, "_language_filter") as run, mock.patch.object(p, "_release_db_connections"):
+                out = plug.run("language_remove", {}, {"settings": {"dry_run": False}})
+                self.assertEqual(out["status"], "error")
+                run.assert_not_called()
+                plug.run("language_preview", {}, {"settings": {"language_filter": True, "dry_run": False}})
+                run.assert_called_once_with({"language_filter": True, "dry_run": False})
+
+
 class OrderSetting(unittest.TestCase):
     def test_default_order_is_unchanged(self):
         field = next(f for f in p._MANIFEST["fields"] if f["id"] == "platform_order")
@@ -223,6 +313,15 @@ class PageScript(unittest.TestCase):
         with mock.patch.object(p, "_page_script_on", return_value=True):
             p._add_to_page(response)
         self.assertIn(b"cleanTitlesDrag", response.content)
+
+    def test_opening_the_list_waits_for_react(self):
+        with open(p.PAGE_SCRIPT, encoding="utf-8") as handle:
+            script = handle.read()
+        self.assertLess(script.index("setTimeout(() => {\n      if (!isOpen(input)) input.click();"), script.index("Enter picks the first"))
+
+    def test_empty_backspace_stays_away_from_mantine(self):
+        with open(p.PAGE_SCRIPT, encoding="utf-8") as handle:
+            self.assertIn("event.key === 'Backspace' && !input.value", handle.read())
 
     def test_script_labels_match_the_field(self):
         label = next(f["label"] for f in p._MANIFEST["fields"] if f["id"] == "platform_order")

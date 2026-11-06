@@ -1,6 +1,6 @@
 {
   "name": "Clean Titles",
-  "version": "2.1.0",
+  "version": "2.2",
   "description": "Renames VOD movies and series in the catalogue to their official titles, looked up by each title's TMDB ID. Removes provider prefixes and tags like 'EN - ... (US)'. Keeps each original name so every rename can be reverted. Can also replace the providers' many categories with the streaming services you select (Netflix, Disney+, Tubi...). Dry run by default. This product uses the TMDB API but is not endorsed or certified by TMDB.",
   "author": "Brxdy22",
   "license": "MIT",
@@ -205,6 +205,20 @@
           "label": "Chinese (Traditional) (zh-TW)"
         }
       ]
+    },
+    {
+      "id": "language_filter",
+      "label": "Remove titles in other languages",
+      "type": "boolean",
+      "default": false,
+      "help_text": "Deletes titles whose original and spoken languages on TMDB don't include the Title language, after each VOD scan. Dispatcharr can't hide titles, and a scan brings them back for a moment until this runs. Titles TMDB has no language for are kept. Use Preview Language Filter first. Turning this off and refreshing the account brings them back, with new IDs."
+    },
+    {
+      "id": "keep_anime",
+      "label": "Keep anime in other languages",
+      "type": "boolean",
+      "default": true,
+      "help_text": "Keeps Japanese animation, anything listed on Crunchyroll, and anything in a provider's anime category, because TMDB can't see dubs."
     },
     {
       "id": "requests_per_second",
@@ -436,6 +450,13 @@
       "help_text": "Movies on none of your selected services that TMDB lists as now playing in cinemas (in the streaming region) go to this category. Empty: off."
     },
     {
+      "id": "rent_buy_group",
+      "label": "Titles only for rent or sale go to",
+      "type": "string",
+      "default": "Rent/Buy",
+      "help_text": "Titles TMDB lists only for rent or purchase, with no subscription or free service at all, go to this category. Empty: off."
+    },
+    {
       "id": "unmatched_group",
       "label": "Titles on none of these services go to",
       "type": "string",
@@ -512,6 +533,29 @@
       "button_variant": "filled",
       "button_color": "grape",
       "async": true
+    },
+    {
+      "id": "language_preview",
+      "label": "Preview Language Filter",
+      "description": "Lists the titles the language filter would remove, and never deletes anything. The first run looks up every title on TMDB (several minutes). The full list is saved as language_report.txt in the plugin's data folder.",
+      "button_label": "Preview",
+      "button_variant": "outline",
+      "button_color": "blue",
+      "async": true
+    },
+    {
+      "id": "language_remove",
+      "label": "Remove Other Languages",
+      "description": "Deletes the titles the preview lists, right now. Needs Remove titles in other languages on, and honors Dry run. Refuses if more than 40% of the movies or series would go.",
+      "button_label": "Remove",
+      "button_variant": "filled",
+      "button_color": "red",
+      "async": true,
+      "confirm": {
+        "required": true,
+        "title": "Remove titles in other languages?",
+        "message": "Titles the preview lists are deleted. They only come back if you turn the filter off and refresh the account, with new IDs."
+      }
     },
     {
       "id": "recheck_all",

@@ -66,7 +66,7 @@
     .filter(Boolean);
 
   const listOf = (input) => document.querySelector(`[aria-labelledby="${input.id}-label"]`);
-  const isOpen = (list) => Boolean(list && list.offsetParent);
+  const isOpen = (input) => input.hasAttribute('data-expanded'); // Mantine's own open flag
   const optionsOf = (list) => [...list.querySelectorAll('[role="option"]')];
 
   const filter = (input) => {
@@ -83,7 +83,9 @@
     });
     searchInputs().forEach((input) => {
       input.readOnly = false;
-      input.style.cursor = 'text';
+      input.placeholder = 'Search...';
+      // Mantine draws a non-searchable field's input invisible, so typed text couldn't be seen.
+      Object.assign(input.style, { cursor: 'text', opacity: 1, position: 'static', height: '1.6em', width: 'auto' });
       filter(input);
     });
   };
@@ -146,8 +148,18 @@
   document.addEventListener('input', (event) => {
     const input = event.target;
     if (!searchInputs().includes(input)) return;
-    if (!isOpen(listOf(input))) input.click();
-    setTimeout(() => filter(input));
+    // After React has read this keystroke: opening the list first redraws the box with the
+    // old text, which undoes the key (a lost letter, or a Backspace that does nothing).
+    setTimeout(() => {
+      if (!isOpen(input)) input.click();
+      setTimeout(() => filter(input));
+    });
+  }, true);
+
+  // Backspace in an empty search box must not reach Mantine, which would remove the last service.
+  document.addEventListener('keydown', (event) => {
+    const input = event.target;
+    if (event.key === 'Backspace' && !input.value && searchInputs().includes(input)) event.stopPropagation();
   }, true);
 
   // Enter picks the first service still showing, not the first one in the full list.

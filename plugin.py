@@ -164,7 +164,8 @@ class Plugin:
 
     _BACKGROUND = {"rename_run": "Rename Run", "revert_all": "Revert All Renames", "tag_duplicates": "Tag Duplicates",
                    "unify_series": "Unify Series", "revert_unify": "Revert Unify", "fix_images": "Fix Images",
-                   "group_categories": "Streaming Categories", "revert_groups": "Revert Streaming Categories"}
+                   "group_categories": "Streaming Categories", "revert_groups": "Revert Streaming Categories",
+                   "language_preview": "Language Preview", "language_remove": "Language Filter"}
 
     def __init__(self):
         self.state = _State()
@@ -190,6 +191,12 @@ class Plugin:
                     return self._group_categories(settings)
                 if action_id == "revert_groups":
                     return self._revert_groups()
+                if action_id == "language_preview":
+                    return self._language_filter(settings)
+                if action_id == "language_remove":
+                    if not settings.get("language_filter"):
+                        return {"status": "error", "message": "Turn on Remove titles in other languages first, and save."}
+                    return self._language_filter(settings, remove=True)
                 if action_id == "rename_run" and not has_key:
                     return {"status": "error", "message": "Set your TMDB API key in the settings first."}
                 if action_id == "rename_run":
@@ -325,7 +332,7 @@ class Plugin:
                     except Exception as exc:  # noqa: BLE001 - counted, logged, run continues
                         st["errors"] += 1
                         if st["errors"] <= 5:
-                            log.warning("%s %s: lookup/rename failed: %s", kind, pk, exc)
+                            log.warning("%s %s: lookup/rename failed: %s", kind, pk, str(exc).replace(key, "***"))
                     if fatal or self.state.has(self.state.stop_path):
                         st["stopped"] = True
                         for f in futures:
@@ -611,6 +618,8 @@ class Plugin:
                 messages.append(f"{account.name}: stopped while waiting for its VOD scan; queued for the next refresh.")
                 break
             messages.append(self._group_categories(settings, notify=False)["message"])
+            if settings.get("language_filter"):  # before renaming, so removed titles aren't renamed first
+                messages.append(self._language_filter(settings, remove=True, notify=False)["message"])
             messages.append(self._fix_images(settings, notify=False, account=account)["message"])
             if (settings.get("tmdb_api_key") or "").strip():
                 messages.append(self._rename_run(settings, account=account)["message"])
@@ -1186,7 +1195,8 @@ class Plugin:
 
     @staticmethod
     def _watch(session, key, kind, tmdb_id, region, limiter):
-        """(networks, subscription services in region) for a title, or None if TMDB has no such title."""
+        """(networks, subscription, free and rent/buy services in region) for a title, or None if
+        TMDB has no such title."""
         url = f"{TMDB}/{'movie' if kind == 'movie' else 'tv'}/{tmdb_id}"
         params = {"append_to_response": "watch/providers"}
         headers = {"Accept": "application/json"}
@@ -1209,16 +1219,25 @@ class Plugin:
             prov = (((d.get("watch/providers") or {}).get("results") or {}).get(region) or {})
             return ([n.get("name", "") for n in d.get("networks") or []],
                     [x.get("provider_name", "") for x in prov.get("flatrate") or []],
-                    [x.get("provider_name", "") for x in (prov.get("free") or []) + (prov.get("ads") or [])])
+                    [x.get("provider_name", "") for x in (prov.get("free") or []) + (prov.get("ads") or [])],
+                    sorted({x.get("provider_name", "") for x in (prov.get("rent") or []) + (prov.get("buy") or [])}))
         raise RuntimeError("TMDB kept rate-limiting (429).")
 
-    def _platforms_for(self, ctype, title_ids, settings, order, st, log):
-        """{title id: service} for these titles, from the cache or TMDB."""
+    @staticmethod
+    def _store_only(entry):
+        """True for a cached answer listing a title for rent or sale and nowhere else, not even
+        on a subscription or free service that isn't selected."""
+        return bool(entry) and len(entry) >= 6 and bool(entry[5]) and not entry[3] and not entry[4]
+
+    def _platforms_for(self, ctype, title_ids, settings, order, st, log, want_stores=False):
+        """({title id: service}, {title id: TMDB id}, title ids only rented or sold) for
+        these titles, from the cache or TMDB. want_stores looks up titles with no selected
+        service again if their cached answer is from before store listings were kept."""
         import requests
         from apps.vod.models import Movie, Series
 
         if not title_ids:
-            return {}
+            return {}, {}, set()
         model = Movie if ctype == "movie" else Series
         region = (settings.get("platform_region") or self._default("platform_region") or "US").strip().upper()
         key = (settings.get("tmdb_api_key") or "").strip()
@@ -1248,8 +1267,13 @@ class Plugin:
             elif e and (e[0] in self.SOFT_PLATFORMS or not e[0]):
                 cache.pop(ck(t))  # no service yet, and TMDB's full answer wasn't kept: ask again
 
-        todo = sorted({t for t in tmdb_of.values()
-                       if now - (cache.get(ck(t)) or [None, 0])[1] > self.PLATFORM_TTL + (int(t) % 7 if str(t).isdigit() else 0) * 86400})
+        def stale(t):
+            e = cache.get(ck(t)) or [None, 0]
+            if now - e[1] > self.PLATFORM_TTL + (int(t) % 7 if str(t).isdigit() else 0) * 86400:
+                return True
+            return want_stores and len(e) == 5 and not self._pick_platform(e[2], e[3], order, e[4])
+
+        todo = sorted({t for t in tmdb_of.values() if stale(t)})
         pst = st.setdefault("platform", {"looked_up": 0, "to_look_up": 0, "errors": 0})
         pst["to_look_up"] += len(todo)
         if todo and not key:
@@ -1267,14 +1291,14 @@ class Plugin:
                         pst["looked_up"] += 1
                         try:
                             res = fut.result()
-                            res = res or ([], [], [])
+                            res = res or ([], [], [], [])
                             cache[ck(t)] = [self._pick_platform(res[0], res[1], order, res[2]), time.time(), *res]
                         except PermissionError as exc:
                             pst["error"] = str(exc)
                         except Exception as exc:  # noqa: BLE001 - counted; looked up again next time
                             pst["errors"] += 1
                             if pst["errors"] <= 3:
-                                log.warning("Streaming lookup %s %s failed: %s", ctype, t, exc)
+                                log.warning("Streaming lookup %s %s failed: %s", ctype, t, str(exc).replace(key, "***"))
                         if pst.get("error") or self.state.has(self.state.stop_path):
                             st["stopped"] = st["stopped"] or self.state.has(self.state.stop_path)
                             for f in futures:
@@ -1288,8 +1312,9 @@ class Plugin:
         entries = [cache[ck(t)] for t in set(tmdb_of.values()) if len(cache.get(ck(t)) or []) >= 5]
         for e in entries:
             e[0] = self._pick_platform(e[2], e[3], order, e[4])
+        in_store = {pk for pk, t in tmdb_of.items() if self._store_only(cache.get(ck(t)))}
         return ({pk: cache[ck(t)][0] for pk, t in tmdb_of.items() if (cache.get(ck(t)) or [""])[0]},
-                tmdb_of)
+                tmdb_of, in_store)
 
     def _now_playing(self, settings, log):
         """TMDB ids of the movies TMDB lists as now playing in the region's cinemas (cached 12 h)."""
@@ -1326,7 +1351,7 @@ class Plugin:
                     pages = int(d.get("total_pages") or 1)
                     page += 1
         except Exception as exc:  # noqa: BLE001 - keep the last list
-            log.warning("Could not fetch the movies in theaters: %s", exc)
+            log.warning("Could not fetch the movies in theaters: %s", str(exc).replace(key, "***"))
             return set(c.get("ids") or [])
         with open(path + ".tmp", "w", encoding="utf-8") as f:
             json.dump({"region": region, "at": time.time(), "ids": sorted(ids)}, f)
@@ -1349,6 +1374,7 @@ class Plugin:
         order = _service_list(self._default("platform_order") if saved is None else saved)
         fallback = lambda k: (settings.get(k) if settings.get(k) is not None else self._default(k) or "").strip()  # noqa: E731
         theaters = fallback("theaters_group")
+        rent_buy = fallback("rent_buy_group")
         unmatched = (settings.get("unmatched_group") or "").strip() or self._default("unmatched_group")
         now_playing = self._now_playing(settings, log) if theaters else set()
         st = {"running": True, "action": "group_categories", "dry_run": dry, "started": time.time(),
@@ -1373,7 +1399,7 @@ class Plugin:
                 used = {n: i for n, i in data.setdefault("used", {}).get(ctype, {}).items()
                         if vm.VODCategory.objects.filter(id=i).exists()}
                 cats = {c.id: c.name for c in vm.VODCategory.objects.filter(category_type=ctype).exclude(id__in=ours)}
-                keep = {unmatched, theaters, *order}
+                keep = {unmatched, theaters, rent_buy, *order}
                 src_target = {}
                 for cid, cname in cats.items():
                     t = self._source_group(cname, rules[ctype], keep)
@@ -1419,10 +1445,10 @@ class Plugin:
                 need = {title for _rid, _cur, title, o in rows
                         if src_target.get(o) and not self._platform_name(src_target[o], order)
                         and title not in platform_of}
-                found, tmdb_of = self._platforms_for(ctype, need, settings, order, st, log)
+                found, tmdb_of, in_store = self._platforms_for(ctype, need, settings, order, st, log, want_stores=bool(rent_buy))
                 platform_of.update(found)
                 rule_names = {t for t, _ in rules[ctype]}
-                sorted_titles, theater_titles, unmatched_titles = set(), set(), set()
+                sorted_titles, theater_titles, rent_titles, unmatched_titles = set(), set(), set(), set()
 
                 for rid, cur, title, o in rows:
                     t = src_target.get(o)  # None: its rule is gone, back to the provider category
@@ -1435,6 +1461,9 @@ class Plugin:
                         elif theaters and ctype == "movie" and str(tmdb_of.get(title)) in now_playing:
                             p = theaters  # still in cinemas, not streaming anywhere yet
                             theater_titles.add(title)
+                        elif rent_buy and title in in_store:
+                            p = rent_buy  # only for rent or sale: on no subscription or free service
+                            rent_titles.add(title)
                         else:
                             p = unmatched  # on none of the selected services (or not on TMDB at all)
                             unmatched_titles.add(title)
@@ -1479,7 +1508,7 @@ class Plugin:
                     self._groups_data(data)
                 st["types"][ctype] = {"before": before, "after": after, "titles": len(moved_titles),
                                       "groups": len({t for t in src_target.values()}),
-                                      "sorted": len(sorted_titles), "theaters": len(theater_titles),
+                                      "sorted": len(sorted_titles), "theaters": len(theater_titles), "rent_buy": len(rent_titles),
                                       "unmatched": len(unmatched_titles)}
                 self.state.write(st)
         except Exception as exc:  # noqa: BLE001
@@ -1495,6 +1524,203 @@ class Plugin:
         if notify:
             self._notify(summary, bool(st.get("failed")),
                          title="Clean Titles: streaming categories applied" if not dry else "Clean Titles: streaming categories (dry run)")
+        return {"status": "ok", "message": summary}
+
+    # --- language filter ------------------------------------------------------------
+    # Dispatcharr can't hide a title, so the filter deletes it, and every VOD scan brings back
+    # what the provider still lists: it runs again after each scan. TMDB knows a title's
+    # original and spoken languages but not the dubs in a provider's file, so anime is kept
+    # on request. Unknown stays: a title is only removed when TMDB clearly says so.
+
+    LANG_CACHE = "languages.json"
+    LANG_REPORT = "language_report.txt"
+    LANG_TTL = 90 * 86400
+    LANG_MAX_SHARE = 0.4  # more than this of a catalogue looks like a wrong setting: refuse
+    ANIMATION_GENRE = 16
+    _ANIME_CATEGORY = __import__("re").compile(r"anime|animi|manga|crunchyroll", __import__("re").I)
+
+    @classmethod
+    def _language_verdict(cls, info, lang, keep_anime):
+        """'keep', 'unknown', 'anime' or 'remove' for [original, spoken, animation, crunchyroll]."""
+        if not info or info[0] in ("", "xx", None):  # xx: TMDB's "no language"
+            return "unknown"
+        original, spoken, animation, crunchyroll = info[:4]
+        if original == lang or lang in spoken:
+            return "keep"
+        if keep_anime and (crunchyroll or (original == "ja" and animation)):
+            return "anime"
+        return "remove"
+
+    @classmethod
+    def _language_info(cls, session, key, kind, tmdb_id, limiter):
+        """[original language, spoken languages, is animation, on Crunchyroll in any region]."""
+        url = f"{TMDB}/{'movie' if kind == 'movie' else 'tv'}/{str(tmdb_id).strip('/')}"
+        params = {"append_to_response": "watch/providers"}
+        headers = {"Accept": "application/json"}
+        if key.startswith("eyJ"):
+            headers["Authorization"] = f"Bearer {key}"
+        else:
+            params["api_key"] = key
+        for attempt in range(4):
+            limiter.wait()
+            r = session.get(url, params=params, headers=headers, timeout=15)
+            if r.status_code == 429:
+                time.sleep(float(r.headers.get("Retry-After", 2)) + attempt)
+                continue
+            if r.status_code == 404:
+                return ["", [], False, False]
+            if r.status_code == 401:
+                raise PermissionError("TMDB rejected the API key (401).")
+            r.raise_for_status()
+            d = r.json()
+            names = {x.get("provider_name", "") for region in ((d.get("watch/providers") or {}).get("results") or {}).values()
+                     for offers in region.values() if isinstance(offers, list) for x in offers}
+            return [d.get("original_language") or "", [x.get("iso_639_1") for x in d.get("spoken_languages") or []],
+                    any(g.get("id") == cls.ANIMATION_GENRE for g in d.get("genres") or []),
+                    any("crunchyroll" in n.casefold() for n in names)]
+        raise RuntimeError("TMDB kept rate-limiting (429).")
+
+    def _language_cache(self, wanted, settings, st, log):
+        """{(type, TMDB id): info}, from the cache or TMDB. Failed lookups are left out."""
+        import requests
+
+        path = os.path.join(self.state.dir, self.LANG_CACHE)
+        try:
+            with open(path, encoding="utf-8") as f:
+                cache = json.load(f)
+        except (OSError, ValueError):
+            cache = {}
+
+        def save():
+            with open(path + ".tmp", "w", encoding="utf-8") as f:
+                json.dump(cache, f)
+            os.replace(path + ".tmp", path)
+
+        now = time.time()
+        ck = lambda kind, t: f"{kind}:{t}"  # noqa: E731
+        todo = sorted(w for w in wanted if now - (cache.get(ck(*w)) or [0] * 5)[4] > self.LANG_TTL)
+        key = (settings.get("tmdb_api_key") or "").strip()
+        st["to_look_up"] = len(todo)
+        if todo and not key:
+            st["error"] = "Set the TMDB API key first."
+            return None
+        if todo:
+            limiter = _RateLimiter(settings.get("requests_per_second") or 20)
+            session = requests.Session()
+            log.info("Looking up the languages of %d titles on TMDB", len(todo))
+            try:
+                with ThreadPoolExecutor(max_workers=8) as pool:
+                    futures = {pool.submit(self._language_info, session, key, kind, t, limiter): (kind, t) for kind, t in todo}
+                    for fut in as_completed(futures):
+                        st["looked_up"] += 1
+                        try:
+                            cache[ck(*futures[fut])] = [*fut.result(), time.time()]
+                        except PermissionError as exc:
+                            st["error"] = str(exc)
+                        except Exception as exc:  # noqa: BLE001 - that title is kept; looked up again next time
+                            st["errors"] += 1
+                            if st["errors"] <= 3:
+                                log.warning("Language lookup %s failed: %s", futures[fut], str(exc).replace(key, "***"))
+                        stopped = self.state.has(self.state.stop_path)
+                        if st.get("error") or stopped:
+                            st["stopped"] = stopped
+                            for f in futures:
+                                f.cancel()
+                            break
+                        if st["looked_up"] % 200 == 0:
+                            self.state.write(st)
+                            save()
+            finally:
+                save()
+        return {w: cache[ck(*w)] for w in wanted if ck(*w) in cache}
+
+    def _anime_titles(self, ctype, rel_name, fk):
+        """Title ids in an anime category, now or (from the sorting's records) at the provider."""
+        from apps.vod import models as vm
+
+        Rel = getattr(vm, rel_name)
+        cats = {i for i, n in vm.VODCategory.objects.filter(category_type=ctype).values_list("id", "name")
+                if self._ANIME_CATEGORY.search(n or "")}
+        titles = set(Rel.objects.filter(category_id__in=cats).values_list(fk, flat=True))
+        rids = [int(r) for r, c in self._groups_data()["orig"].get(ctype, {}).items() if c in cats]
+        for i in range(0, len(rids), 5000):
+            titles.update(Rel.objects.filter(id__in=rids[i:i + 5000]).values_list(fk, flat=True))
+        return titles
+
+    def _language_filter(self, settings, remove=False, notify=True):
+        """Reports (or with remove, deletes) titles not in the Title language."""
+        import logging
+        from collections import Counter
+
+        from django.db import transaction
+        from apps.vod import models as vm
+
+        log = logging.getLogger(LOGGER_NAME)
+        lang = (settings.get("language") or self._default("language") or "en-US").split("-")[0].strip().lower()
+        keep_anime = settings.get("keep_anime", self._default("keep_anime"))
+        dry = bool(settings.get("dry_run", True))
+        st = {"running": True, "action": "language_filter", "remove": remove, "dry_run": dry, "language": lang,
+              "started": time.time(), "types": {}, "looked_up": 0, "to_look_up": 0, "errors": 0, "stopped": False}
+        self.state.flag(self.state.stop_path, False)
+        self.state.write(st)
+        try:
+            rows = {}
+            for ctype, rel_name, fk in self._GROUP_TYPES:
+                model = vm.Movie if ctype == "movie" else vm.Series
+                rows[ctype] = list(model.objects.exclude(tmdb_id__isnull=True).exclude(tmdb_id="")
+                                   .values_list("id", "tmdb_id", "name", "year"))
+            wanted = {(ctype, t) for ctype, items in rows.items() for _i, t, _n, _y in items}
+            infos = self._language_cache(wanted, settings, st, log)
+            if infos is not None and not st.get("error") and not st.get("stopped"):
+                gone, report, languages = {}, [], Counter()
+                for ctype, rel_name, fk in self._GROUP_TYPES:
+                    model = vm.Movie if ctype == "movie" else vm.Series
+                    anime_ids = self._anime_titles(ctype, rel_name, fk) if keep_anime else set()
+                    tally = Counter()
+                    gone[ctype] = []
+                    for pk, t, name, year in rows[ctype]:
+                        info = infos.get((ctype, t))
+                        verdict = self._language_verdict(info, lang, keep_anime)
+                        if verdict == "remove" and pk in anime_ids:
+                            verdict = "anime"
+                        tally[verdict] += 1
+                        if verdict == "remove":
+                            gone[ctype].append(pk)
+                            languages[info[0]] += 1
+                            report.append((ctype, info[0], name or "", year or ""))
+                    total = model.objects.count()
+                    st["types"][ctype] = {"total": total, "matched": tally["remove"], "anime": tally["anime"],
+                                          "unknown": tally["unknown"]}
+                    if total and tally["remove"] > total * self.LANG_MAX_SHARE:
+                        st["refused"] = (f"Nothing removed: {tally['remove']} of {total} {ctype} titles is more than "
+                                         f"{self.LANG_MAX_SHARE:.0%}. Check Title language.")
+                path = os.path.join(self.state.dir, self.LANG_REPORT)
+                with open(path + ".tmp", "w", encoding="utf-8") as f:
+                    f.writelines(f"{c}\t{code}\t{n}\t{y}\n" for c, code, n, y in sorted(report, key=lambda r: tuple(map(str, r))))
+                os.replace(path + ".tmp", path)
+                st["report"] = path
+                st["languages"] = languages.most_common(10)
+                st["samples"] = [f"{r[2]} ({r[1]})" for r in report[:: max(1, len(report) // 10)][:10]]
+                if remove and not dry and not st.get("refused"):
+                    for ctype, pks in gone.items():
+                        model = vm.Movie if ctype == "movie" else vm.Series
+                        for i in range(0, len(pks), 500):
+                            with transaction.atomic():
+                                model.objects.filter(id__in=pks[i:i + 500]).delete()
+                            self.state.write(st)
+                    st["done"] = True
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Language filter failed")
+            st["failed"] = f"Failed: {exc}"
+        finally:
+            _release_db_connections()
+        st["running"] = False
+        st["finished"] = time.time()
+        self.state.write(st)
+        summary = self._describe(st)
+        log.info("Language filter finished: %s", summary.replace("\n", " | "))
+        if notify or st.get("refused") or st.get("failed"):
+            self._notify(summary, bool(st.get("refused") or st.get("failed")), title="Clean Titles: language filter")
         return {"status": "ok", "message": summary}
 
     def _revert_groups(self):
@@ -1611,13 +1837,15 @@ class Plugin:
             srt = sum((t or {}).get("sorted", 0) for t in (st.get("types") or {}).values())
             thr = sum((t or {}).get("theaters", 0) for t in (st.get("types") or {}).values())
             unm = sum((t or {}).get("unmatched", 0) for t in (st.get("types") or {}).values())
+            rnt = sum((t or {}).get("rent_buy", 0) for t in (st.get("types") or {}).values())
             pl = st.get("platform")
             if pl:
                 lines.append(f"Streaming services: {srt} titles {'would be' if dry else ''} filed under their service"
                              f" ({pl.get('looked_up', 0)}/{pl.get('to_look_up', 0)} looked up on TMDB"
                              f"{', ' + str(pl['errors']) + ' lookups failed' if pl.get('errors') else ''}).")
-                if thr or unm:
-                    lines.append(f"{thr} movies in theaters, {unm} titles on no streaming service (Uncategorized).")
+                if thr or rnt or unm:
+                    lines.append(f"{thr} movies in theaters, {rnt} titles for rent or sale only,"
+                                 f" {unm} titles on no streaming service (Uncategorized).")
                 if pl.get("no_key"):
                     lines.append("Set the TMDB API key to look up streaming services of new titles.")
                 if pl.get("error"):
@@ -1627,6 +1855,26 @@ class Plugin:
             if st.get("failed"):
                 lines.append(f"Failed: {st['failed']}")
             return "\n".join(lines).replace("  ", " ")
+        if st.get("action") == "language_filter":
+            removing = st.get("remove") and not st.get("dry_run")
+            lines = [f"Language filter {'' if removing else 'preview '}{state}: keeping titles in {st.get('language')}."]
+            for ctype, label in (("movie", "Movies"), ("series", "Series")):
+                t = (st.get("types") or {}).get(ctype)
+                if t:
+                    lines.append(f"{label}: {t['matched']} of {t['total']} {'removed' if st.get('done') else 'would be removed'},"
+                                 f" {t['anime']} kept as anime, {t['unknown']} kept with no language on TMDB.")
+            lines.append(f"{st.get('looked_up', 0)}/{st.get('to_look_up', 0)} looked up on TMDB"
+                         f"{', ' + str(st['errors']) + ' lookups failed (those titles are kept)' if st.get('errors') else ''}.")
+            if st.get("languages"):
+                lines.append("Languages: " + ", ".join(f"{k} {n}" for k, n in st["languages"]))
+            if st.get("samples"):
+                lines.append("Examples: " + "; ".join(st["samples"]))
+            if st.get("report"):
+                lines.append(f"Full list: {st['report']}")
+            for key in ("refused", "error", "failed"):
+                if st.get(key):
+                    lines.append(st[key])
+            return "\n".join(lines)
         if st.get("action") == "revert_groups":
             return (f"Revert streaming categories {state}: {st.get('reverted', 0)} titles back in their provider categories"
                     f"{', ' + str(st['left']) + ' left for the next refresh to reset' if st.get('left') else ''}"

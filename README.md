@@ -12,7 +12,7 @@ Tested on Dispatcharr 0.33.0.
 
 Copy this repository's files into `/data/plugins/clean_titles` in your Dispatcharr data folder, then enable **Clean Titles** on the Plugins page.
 
-Or download `clean_titles-2.1.0.zip` from Releases and import it on the Plugins page. Use that zip rather than GitHub's source zip, because Dispatcharr names the plugin after the zip's top folder.
+Or download `clean_titles-2.2.zip` from Releases and import it on the Plugins page. Use that zip rather than GitHub's source zip, because Dispatcharr names the plugin after the zip's top folder.
 
 ## Use
 
@@ -20,6 +20,8 @@ Or download `clean_titles-2.1.0.zip` from Releases and import it on the Plugins 
 2. **Rename Run** starts as a dry run, so check the results before turning dry run off.
 3. Original names are kept, so **Revert All Renames** puts everything back.
 4. Pick your services in **Select Streaming Services to Use + Priority**, then run **Apply Streaming Categories**. **Revert Streaming Categories** puts titles back in their provider categories.
+5. Titles only for rent or sale go to their own category, **Rent/Buy** by default.
+6. To remove titles in other languages, run **Preview Language Filter**, turn on **Remove titles in other languages**, then press **Remove**. It deletes titles, because Dispatcharr can't hide them, and runs again after each VOD scan. Turning it off and refreshing the account brings them back with new IDs.
 
 ## Notes
 

@@ -209,6 +209,19 @@ class RentBuy(unittest.TestCase):
         self.assertTrue(mature("series", rated(("US", "TV-PG"), ("GB", "12"), ("DE", "12"), ("FR", "12"))))
         self.assertFalse(mature("series", rated(("US", "TV-PG"), ("GB", "12"), ("DE", "12"), ("FR", "0"))))
 
+    def test_provider_prefix_and_tags_come_off_a_name(self):
+        strip = p.Plugin._strip_provider_tags
+        self.assertEqual(strip("NF - Pokemon: The Arceus Chronicles (Movie Version)  (2022)"),
+                         ("Pokemon: The Arceus Chronicles (Movie Version)", 2022))
+        self.assertEqual(strip("4K-AMZ - Die Hart 2: Die Harter (2024)"), ("Die Hart 2: Die Harter", 2024))
+        self.assertEqual(strip("D+ - The Little Prince(ss) (US)"), ("The Little Prince(ss)", None))
+        self.assertEqual(strip("AMZ - The Perfect Miss (2024) (DE)"), ("The Perfect Miss", 2024))
+
+    def test_a_name_with_no_known_prefix_is_left_alone(self):
+        strip = p.Plugin._strip_provider_tags
+        self.assertIsNone(strip("Avicii - I'm Tim"))
+        self.assertIsNone(strip("Pokemon: The Arceus Chronicles"))
+
     def test_free_with_ads_on_prime_video_beats_the_order(self):
         free = ["Amazon Prime Video Free with Ads", "Tubi TV"]
         order = ["Netflix", "Prime Video", "Tubi"]

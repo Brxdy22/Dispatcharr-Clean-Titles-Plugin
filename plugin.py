@@ -262,6 +262,35 @@ class Plugin:
             return title, year, imdb
         raise RuntimeError("TMDB kept rate-limiting (429).")
 
+    # Only these prefixes: a dead ID on "Avicii - I'm Tim" must not cut the name down.
+    _PROVIDER_PREFIX = __import__("re").compile(r"^\s*(?:4K-)?(?:EN|NF|AMZ|D\+|CR|DSC\+|MAX|A\+|OSN\+|TOP)\s+-\s+(\S.*)$",
+                                                __import__("re").I)
+    _NAME_TAIL = __import__("re").compile(r"\s*\((?:(\d{4})|[A-Z]{2})\)\s*$")
+
+    @classmethod
+    def _strip_provider_tags(cls, name):
+        """(title, year in the name) without a known provider prefix and trailing tags like
+        "(2022)" or "(US)", or None if the name has no such prefix."""
+        m = cls._PROVIDER_PREFIX.match(name or "")
+        if not m:
+            return None
+        title, year = " ".join(m.group(1).split()), None
+        while True:
+            tail = cls._NAME_TAIL.search(title)
+            if not tail:
+                break
+            year = year or (int(tail.group(1)) if tail.group(1) else None)
+            title = title[:tail.start()].rstrip()
+        return (title, year) if title else None
+
+    def _name_without_prefix(self, model, pk):
+        """(title, year, imdb id) for a title whose TMDB ID is dead, or None. Only titles with an
+        ID get here: scans match those by ID and keep their name, while a title with no ID is
+        matched by its exact name, so renaming it would make the next scan add it again."""
+        row = model.objects.only("id", "name", "year").get(pk=pk)
+        cleaned = self._strip_provider_tags(row.name)
+        return (cleaned[0], cleaned[1] or row.year, None) if cleaned else None
+
     @staticmethod
     def _format(title, year, fmt):
         return f"{title} ({year})" if fmt == "title_year" and year else title
@@ -324,6 +353,8 @@ class Plugin:
                     try:
                         found = fut.result()
                         if found is None or not found[0]:
+                            found = self._name_without_prefix(models[kind], pk)
+                        if found is None:
                             st["not_found"] += 1
                         else:
                             self._apply(models[kind], kind, pk, found, fmt, language, dry, st, transaction, IntegrityError)

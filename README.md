@@ -12,7 +12,7 @@ Tested on Dispatcharr 0.33.0.
 
 Copy this repository's files into `/data/plugins/clean_titles` in your Dispatcharr data folder, then enable **Clean Titles** on the Plugins page.
 
-Or download `clean_titles-2.0.0.zip` from Releases and import it on the Plugins page. Use that zip rather than GitHub's source zip, because Dispatcharr names the plugin after the zip's top folder.
+Or download `clean_titles-2.1.0.zip` from Releases and import it on the Plugins page. Use that zip rather than GitHub's source zip, because Dispatcharr names the plugin after the zip's top folder.
 
 ## Use
 
@@ -24,6 +24,14 @@ Or download `clean_titles-2.0.0.zip` from Releases and import it on the Plugins 
 ## Notes
 
 - Titles without a TMDB ID are left alone, because renaming them would create duplicates on the next VOD refresh.
+
+## Drag and search
+
+Dispatcharr's multi-select can't be sorted or searched, so this plugin adds both to **Select Streaming Services to Use + Priority**: drag a service to change its priority, and type to search the list.
+
+It does this by adding a small script to Dispatcharr's web page as the page is sent, on every page while the plugin is enabled. No files are changed. Turn off **Drag and search in the service list** to remove it, then refresh the page. Without it, priority is the order you pick services.
+
+Dispatcharr needs a restart after installing for this to reach every page load.
 
 ## Release notes
 

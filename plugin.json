@@ -1,6 +1,6 @@
 {
   "name": "Clean Titles",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Renames VOD movies and series in the catalogue to their official titles, looked up by each title's TMDB ID. Removes provider prefixes and tags like 'EN - ... (US)'. Keeps each original name so every rename can be reverted. Can also replace the providers' many categories with the streaming services you select (Netflix, Disney+, Tubi...). Dry run by default. This product uses the TMDB API but is not endorsed or certified by TMDB.",
   "author": "Brxdy22",
   "license": "MIT",
@@ -232,9 +232,16 @@
         "AMC+",
         "MGM+"
       ],
-      "help_text": "These become your VOD categories, replacing the providers' own, most important first: a title on several goes to the first one here, paid or free. Kids titles go to a service's Kids category. Titles on none of them go to the category set below. Leave this empty to stop sorting. The list shows services in your Streaming region, most popular first. To change priority, remove a service and pick it again. Starz, AMC+ and MGM+ are last resorts: they only win when none of the others streams the title, even for their own originals. After changing the region, Save and press Reload Plugin at the top of this page to update this list.",
+      "help_text": "These become your VOD categories, replacing the providers' own, most important first: a title on several goes to the first one here, paid or free. Kids titles go to a service's Kids category. Titles on none of them go to the category set below. Leave this empty to stop sorting. The list shows services in your Streaming region, most popular first. Drag a service to change its priority, and type to search the list. Starz, AMC+ and MGM+ are last resorts: they only win when none of the others streams the title, even for their own originals. After changing the region, Save and press Reload Plugin at the top of this page to update this list.",
       "options": [],
       "placeholder": "Choose services"
+    },
+    {
+      "id": "drag_and_search",
+      "type": "boolean",
+      "label": "Drag and search in the service list",
+      "default": true,
+      "help_text": "Adds dragging and search to the field above, by adding a small script to Dispatcharr's page. Turn this off to use the plain list, where priority is the order you pick services. Refresh the page after changing this."
     },
     {
       "id": "platform_region",

@@ -1703,3 +1703,56 @@ class Plugin:
         except Exception as exc:  # noqa: BLE001 - a notification must never fail the run
             logging.getLogger(LOGGER_NAME).warning("Could not send the notification: %s", exc)
 
+
+# --- drag and search ----------------------------------------------------------
+# Dispatcharr's multi-select can't be sorted or searched, and plugins have no way to add to
+# the settings page. Its page is rendered by this same Python process, so the browser code
+# goes in as the page is sent. Nothing on disk changes, and any failure leaves the stock page.
+PAGE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "drag_and_search.js")
+
+
+def add_page_script(html, script):
+    """The page with the script added at the end of its body."""
+    tag = "<script>" + script.replace("</", "<\\/") + "</script>"
+    return html.replace("</body>", tag + "</body>", 1)
+
+
+def _page_script_on():
+    from apps.plugins.models import PluginConfig
+
+    config = PluginConfig.objects.filter(key="clean_titles").first()
+    return bool(config and config.enabled and (config.settings or {}).get("drag_and_search", True))
+
+
+def _add_to_page(response):
+    try:
+        if _page_script_on():
+            with open(PAGE_SCRIPT, encoding="utf-8") as handle:
+                response.content = add_page_script(response.content.decode("utf-8"), handle.read()).encode("utf-8")
+    except Exception:  # noqa: BLE001 - the page must always load
+        logging.getLogger(LOGGER_NAME).exception("Could not add drag and search to the page")
+
+
+def _patch_page():
+    """Runs once per process. A reloaded plugin keeps the first patch, which reads the
+    setting and the script on every page."""
+    from django.views.generic import TemplateView
+
+    if getattr(TemplateView, "clean_titles_patched", False):
+        return
+    original = TemplateView.render_to_response
+
+    def render_to_response(self, context, **kwargs):
+        response = original(self, context, **kwargs)
+        if self.template_name == "index.html":
+            response.add_post_render_callback(_add_to_page)
+        return response
+
+    TemplateView.render_to_response = render_to_response
+    TemplateView.clean_titles_patched = True
+
+
+try:
+    _patch_page()
+except ImportError:  # outside Dispatcharr, as in the tests
+    pass

@@ -194,5 +194,41 @@ class OrderSetting(unittest.TestCase):
         self.assertEqual(p._service_list(None), [])
 
 
+
+class PageScript(unittest.TestCase):
+    def test_goes_at_the_end_of_the_body(self):
+        html = p.add_page_script("<html><body><div></div></body></html>", "go();")
+        self.assertEqual(html, "<html><body><div></div><script>go();</script></body></html>")
+
+    def test_script_cannot_close_its_own_tag(self):
+        self.assertNotIn("</script>x", p.add_page_script("<body></body>", "a('</script>x');"))
+
+    def test_page_without_a_body_is_left_alone(self):
+        self.assertEqual(p.add_page_script("<p></p>", "go();"), "<p></p>")
+
+    def test_failure_leaves_the_page_alone(self):
+        response = mock.Mock(content=b"<body></body>")
+        with mock.patch.object(p, "_page_script_on", side_effect=RuntimeError):
+            p._add_to_page(response)
+        self.assertEqual(response.content, b"<body></body>")
+
+    def test_off_leaves_the_page_alone(self):
+        response = mock.Mock(content=b"<body></body>")
+        with mock.patch.object(p, "_page_script_on", return_value=False):
+            p._add_to_page(response)
+        self.assertEqual(response.content, b"<body></body>")
+
+    def test_on_adds_the_shipped_script(self):
+        response = mock.Mock(content=b"<body></body>")
+        with mock.patch.object(p, "_page_script_on", return_value=True):
+            p._add_to_page(response)
+        self.assertIn(b"cleanTitlesDrag", response.content)
+
+    def test_script_labels_match_the_field(self):
+        label = next(f["label"] for f in p._MANIFEST["fields"] if f["id"] == "platform_order")
+        with open(p.PAGE_SCRIPT, encoding="utf-8") as handle:
+            self.assertIn(label, handle.read())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -211,16 +211,60 @@ class RentBuy(unittest.TestCase):
 
     def test_provider_prefix_and_tags_come_off_a_name(self):
         strip = p.Plugin._strip_provider_tags
-        self.assertEqual(strip("NF - Pokemon: The Arceus Chronicles (Movie Version)  (2022)"),
-                         ("Pokemon: The Arceus Chronicles (Movie Version)", 2022))
-        self.assertEqual(strip("4K-AMZ - Die Hart 2: Die Harter (2024)"), ("Die Hart 2: Die Harter", 2024))
-        self.assertEqual(strip("D+ - The Little Prince(ss) (US)"), ("The Little Prince(ss)", None))
-        self.assertEqual(strip("AMZ - The Perfect Miss (2024) (DE)"), ("The Perfect Miss", 2024))
+        self.assertEqual(strip("NF - Movie Title: Part One (Movie Version)  (2022)"),
+                         ("Movie Title: Part One (Movie Version)", 2022))
+        self.assertEqual(strip("4K-AMZ - Movie Title 2: Subtitle (2024)"), ("Movie Title 2: Subtitle", 2024))
+        self.assertEqual(strip("D+ - Show Title(s) (US)"), ("Show Title(s)", None))
+        self.assertEqual(strip("AMZ - Show Title (2024) (DE)"), ("Show Title", 2024))
 
     def test_a_name_with_no_known_prefix_is_left_alone(self):
         strip = p.Plugin._strip_provider_tags
-        self.assertIsNone(strip("Avicii - I'm Tim"))
-        self.assertIsNone(strip("Pokemon: The Arceus Chronicles"))
+        self.assertIsNone(strip("Artist - Concert Name"))
+        self.assertIsNone(strip("Movie Title: Part One"))
+
+    def test_same_title_key_ignores_tags_punctuation_and_accents(self):
+        key = p.Plugin._same_title_key
+        self.assertEqual(key("Movie Title 2 Subtitle"), key("Movie Title 2: Subtitle 4k"))
+        self.assertEqual(key("Movie: Title"), key("Móvie: Title [NF]"))
+        self.assertNotEqual(key("Movie Title"), key("Movie Title 2"))
+        self.assertEqual(key("Móvie Title: Part One"), key("Movie Title: Part One (Movie Version)"))
+
+    def test_runtimes_far_apart_mean_different_films(self):
+        same = p.Plugin._same_length
+        film = lambda secs: mock.Mock(duration_secs=secs)  # noqa: E731
+        self.assertFalse(same(film(5400), film(7200)))
+        self.assertTrue(same(film(5400), film(5500)))
+        self.assertTrue(same(film(None), film(7200)))
+
+    def test_a_finished_scan_ends_the_wait_at_once(self):
+        relation = mock.Mock()
+        relation.objects.filter.return_value.exists.return_value = True
+        models = mock.Mock(M3UMovieRelation=relation, M3USeriesRelation=relation)
+        plugin = p.Plugin()
+        with mock.patch.dict("sys.modules", {"apps.vod.models": models, "apps.vod": mock.Mock(), "apps": mock.Mock()}), \
+                mock.patch.object(p, "_aware", lambda t: t), mock.patch.object(plugin, "_vod_scan_running", return_value=False), \
+                mock.patch.object(p.time, "sleep", side_effect=AssertionError("waited")):
+            plugin.state = mock.Mock()
+            plugin.state.has.return_value = False
+            account = mock.Mock(id=1)
+            account.name = "Provider"
+            self.assertTrue(plugin._wait_for_vod_scan(account, time.time(), mock.Mock(), time.time() - 900))
+
+    def test_a_title_search_needs_one_exact_match(self):
+        find = p.Plugin._find_title
+        one = [{"id": 7, "title": "Word Play"}, {"id": 8, "title": "Wordplay: Part 2"}]
+        two = [{"id": 7, "title": "Home"}, {"id": 8, "title": "Home"}]
+        with mock.patch.object(p.Plugin, "_tmdb_search", return_value=one):
+            self.assertEqual(find(None, "k", "movie", "Wordplay", 2023, "en-US", None), ["7", "Word Play"])
+        with mock.patch.object(p.Plugin, "_tmdb_search", return_value=two):
+            self.assertIsNone(find(None, "k", "movie", "Home", 2020, "en-US", None))
+
+    def test_a_match_of_the_other_type_gives_the_name_but_no_id(self):
+        answers = [[], [{"id": 12345, "name": "Móvie Title: Part One"}]]
+        with mock.patch.object(p.Plugin, "_tmdb_search", side_effect=answers) as search:
+            found = p.Plugin._find_title(None, "k", "movie", "Movie Title Part One (Movie Version)", 2022, "en-US", None)
+        self.assertEqual(found, [None, "Móvie Title: Part One"])
+        self.assertEqual(search.call_args_list[0].args[3], "Movie Title Part One")
 
     def test_free_with_ads_on_prime_video_beats_the_order(self):
         free = ["Amazon Prime Video Free with Ads", "Tubi TV"]
@@ -264,7 +308,7 @@ class Language(unittest.TestCase):
     def test_original_or_spoken_english_stays(self):
         self.assertEqual(self.verdict(["en", [], False, False]), "keep")
         self.assertEqual(self.verdict(["de", ["de", "en"], False, False]), "keep")
-        self.assertEqual(self.verdict(["ko", ["en", "ko"], False, False]), "keep")  # Squid Game
+        self.assertEqual(self.verdict(["ko", ["en", "ko"], False, False]), "keep")  # a foreign title with English audio
 
     def test_other_languages_go(self):
         self.assertEqual(self.verdict(["fr", ["fr"], False, False]), "remove")

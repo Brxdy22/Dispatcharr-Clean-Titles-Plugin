@@ -1,6 +1,6 @@
 {
   "name": "Clean Titles",
-  "version": "2.2.0.2",
+  "version": "2.2.0.3",
   "description": "Renames VOD movies and series in the catalogue to their official titles, looked up by each title's TMDB ID. Removes provider prefixes and tags like 'EN - ... (US)'. Keeps each original name so every rename can be reverted. Can also replace the providers' many categories with the streaming services you select (Netflix, Disney+, Tubi...). Dry run by default. This product uses the TMDB API but is not endorsed or certified by TMDB.",
   "author": "Brxdy22",
   "license": "MIT",
@@ -48,14 +48,21 @@
       "options": [
         {
           "value": "title",
-          "label": "Title  (e.g. Dexter: Resurrection)"
+          "label": "Title  (e.g. Movie Title)"
         },
         {
           "value": "title_year",
-          "label": "Title (Year)  (e.g. Dexter: Resurrection (2025))"
+          "label": "Title (Year)  (e.g. Movie Title (2025))"
         }
       ],
       "help_text": "Dispatcharr shows the year separately, so plain Title is usually best."
+    },
+    {
+      "id": "tidy_no_id",
+      "label": "Clean titles with no TMDB ID",
+      "type": "boolean",
+      "default": false,
+      "help_text": "After each VOD scan, joins these titles to a matching title that has an ID, looks them up on TMDB by exact name and year, or removes the provider prefix. Scans add them back under the provider's name, so they get new IDs each scan, and players may lose their place in them."
     },
     {
       "id": "language",
@@ -496,7 +503,7 @@
     {
       "id": "tag_duplicates",
       "label": "Tag Duplicates",
-      "description": "Titles that exist twice (same TMDB ID, split by provider category) get a short provider tag so you can tell them apart, e.g. 'Zero Day [EN]' / 'Zero Day [NF]'. 4K is left out of the tag ('4K-D+' -> 'D+') unless both '4K-D+' and 'D+' exist. Runs automatically at the end of every real Rename Run. Honors Dry run.",
+      "description": "Titles that exist twice (same TMDB ID, split by provider category) get a short provider tag so you can tell them apart, e.g. 'Movie Title [EN]' / 'Movie Title [NF]'. 4K is left out of the tag ('4K-D+' -> 'D+') unless both '4K-D+' and 'D+' exist. Runs automatically at the end of every real Rename Run. Honors Dry run.",
       "button_label": "Tag",
       "button_variant": "outline",
       "button_color": "blue",

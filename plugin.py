@@ -200,7 +200,9 @@ class Plugin:
                 if action_id == "rename_run" and not has_key:
                     return {"status": "error", "message": "Set your TMDB API key in the settings first."}
                 if action_id == "rename_run":
-                    return self._rename_run(settings)
+                    tidied = self._tidy_no_id(settings) if settings.get("tidy_no_id") else ""
+                    result = self._rename_run(settings)
+                    return dict(result, message=f"{tidied}\n{result['message']}".strip())
                 if action_id == "tag_duplicates":
                     dry = bool(settings.get("dry_run", True))
                     summary = self._describe_tags(self._tag_duplicates(dry), dry)
@@ -262,7 +264,7 @@ class Plugin:
             return title, year, imdb
         raise RuntimeError("TMDB kept rate-limiting (429).")
 
-    # Only these prefixes: a dead ID on "Avicii - I'm Tim" must not cut the name down.
+    # Only these prefixes: a dead ID on "Artist - Concert Name" must not cut the name down.
     _PROVIDER_PREFIX = __import__("re").compile(r"^\s*(?:4K-)?(?:EN|NF|AMZ|D\+|CR|DSC\+|MAX|A\+|OSN\+|TOP)\s+-\s+(\S.*)$",
                                                 __import__("re").I)
     _NAME_TAIL = __import__("re").compile(r"\s*\((?:(\d{4})|[A-Z]{2})\)\s*$")
@@ -294,6 +296,189 @@ class Plugin:
     @staticmethod
     def _format(title, year, fmt):
         return f"{title} ({year})" if fmt == "title_year" and year else title
+
+    # --- titles with no ID ----------------------------------------------------------
+    # A VOD scan matches these by exact name and year, so a clean name doesn't last: the next
+    # scan adds the provider's name again and moves the stream to it, and Dispatcharr deletes
+    # the row left empty. This runs after every scan, before the sorting, and undoes that.
+
+    @staticmethod
+    def _same_title_key(name):
+        """A name reduced for comparing, so "Movie: Title 4k" meets "Movie Title"."""
+        import re
+        import unicodedata
+
+        name = re.sub(r"\s*\[[^\]]*\]\s*$", "", name or "")  # a duplicate tag: "Title [NF]"
+        name = re.sub(r"\((?:\d{4}|[A-Z]{2}|Movie Version)\)", " ", name, flags=re.I)
+        name = re.sub(r"\b(?:4k|uhd)\b", " ", name, flags=re.I)
+        name = "".join(c for c in unicodedata.normalize("NFKD", name) if not unicodedata.combining(c))
+        return re.sub(r"[^a-z0-9]", "", name.casefold())
+
+    @staticmethod
+    def _same_length(a, b):
+        """False only if both are movies with known runtimes over 10 minutes apart."""
+        one, two = getattr(a, "duration_secs", None), getattr(b, "duration_secs", None)
+        return not one or not two or abs(one - two) <= 600
+
+    @staticmethod
+    def _title_year(row):
+        """A title's year, else the one in the provider's release date."""
+        cp = row.custom_properties if isinstance(row.custom_properties, dict) else {}
+        date = str(cp.get("releaseDate") or cp.get("release_date") or cp.get("releasedate") or "")
+        return row.year or (int(date[:4]) if date[:4].isdigit() else None)
+
+    @staticmethod
+    def _tmdb_search(session, key, kind, title, year, language, limiter):
+        """TMDB's search results for a title in that year."""
+        params = {"query": title, "language": language, "include_adult": "false",
+                  "primary_release_year" if kind == "movie" else "first_air_date_year": year}
+        headers = {"Accept": "application/json"}
+        if key.startswith("eyJ"):
+            headers["Authorization"] = f"Bearer {key}"
+        else:
+            params["api_key"] = key
+        for attempt in range(4):
+            limiter.wait()
+            r = session.get(f"{TMDB}/search/{'movie' if kind == 'movie' else 'tv'}", params=params, headers=headers, timeout=15)
+            if r.status_code == 429:
+                time.sleep(float(r.headers.get("Retry-After", 2)) + attempt)
+                continue
+            if r.status_code == 401:
+                raise PermissionError("TMDB rejected the API key (401).")
+            r.raise_for_status()
+            return r.json().get("results") or []
+        raise RuntimeError("TMDB kept rate-limiting (429).")
+
+    @classmethod
+    def _exact_hits(cls, results, title):
+        """The results whose title or original title is this title."""
+        want = cls._same_title_key(title)
+        return [x for x in results if want and want in (cls._same_title_key(x.get("title") or x.get("name")),
+                                                        cls._same_title_key(x.get("original_title") or x.get("original_name")))]
+
+    @classmethod
+    def _find_title(cls, session, key, ctype, title, year, language, limiter):
+        """[TMDB id or None, official title] for one exact match in that year, else None. A match
+        of the other type (a movie TMDB lists as a series) gives the name but no ID, because the
+        ID would mean a different title to Dispatcharr."""
+        query = cls._SEARCH_TAIL.sub("", title).strip()
+        own, other = ("movie", "series") if ctype == "movie" else ("series", "movie")
+        hits = cls._exact_hits(cls._tmdb_search(session, key, own, query, year, language, limiter), query)
+        if len(hits) == 1:
+            return [str(hits[0]["id"]), hits[0].get("title") or hits[0].get("name")]
+        if hits:
+            return None
+        hits = cls._exact_hits(cls._tmdb_search(session, key, other, query, year, language, limiter), query)
+        return [None, hits[0].get("title") or hits[0].get("name")] if len(hits) == 1 else None
+
+    def _search_titles(self, wanted, settings, log):
+        """{(type, title, year): match or None} for these titles, from the cache or TMDB. A failed
+        search is left out, so the title is only renamed this time."""
+        import requests
+
+        key = (settings.get("tmdb_api_key") or "").strip()
+        language = (settings.get("language") or "en-US").strip()
+        path = os.path.join(self.state.dir, self.SEARCH_CACHE)
+        try:
+            with open(path, encoding="utf-8") as f:
+                cache = json.load(f)
+        except (OSError, ValueError):
+            cache = {}
+        ck = lambda w: f"{w[0]}:{self._same_title_key(w[1])}:{w[2]}"  # noqa: E731
+        now = time.time()
+        todo = sorted(w for w in wanted if now - (cache.get(ck(w)) or [None, 0])[1] > self.PLATFORM_TTL)
+        if todo and key:
+            limiter = _RateLimiter(settings.get("requests_per_second") or 20)
+            session = requests.Session()
+            log.info("Searching TMDB for %d titles with no ID", len(todo))
+            try:
+                with ThreadPoolExecutor(max_workers=8) as pool:
+                    futures = {pool.submit(self._find_title, session, key, w[0], w[1], w[2], language, limiter): w for w in todo}
+                    for fut in as_completed(futures):
+                        try:
+                            cache[ck(futures[fut])] = [fut.result(), time.time()]
+                        except Exception as exc:  # noqa: BLE001 - searched again next time
+                            log.warning("Title search failed: %s", str(exc).replace(key, "***"))
+            finally:
+                with open(path + ".tmp", "w", encoding="utf-8") as f:
+                    json.dump(cache, f)
+                os.replace(path + ".tmp", path)
+        return {w: cache[ck(w)][0] for w in wanted if ck(w) in cache}
+
+    def _tidy_no_id(self, settings):
+        """Titles with no TMDB or IMDb ID and a known provider prefix: joined to the one title of
+        the same name and year that has an ID, or to one already clean, else renamed."""
+        from django.db import IntegrityError, transaction
+        from django.db.models import Q
+        from apps.vod import models as vm
+        from apps.vod.tasks import _absorb_language_row
+
+        log = logging.getLogger(LOGGER_NAME)
+        dry = bool(settings.get("dry_run", True))
+        scope = settings.get("scope") or "both"
+        fmt = settings.get("name_format") or "title"
+        language = (settings.get("language") or "en-US").strip()
+        done = {"merged": 0, "found": 0, "renamed": 0, "failed": 0}
+        try:
+            for ctype, model, rel, fk in (("movie", vm.Movie, vm.M3UMovieRelation, "movie"),
+                                          ("series", vm.Series, vm.M3USeriesRelation, "series")):
+                if scope not in ("both", "movies" if ctype == "movie" else "series"):
+                    continue
+                loose = []
+                for r in model.objects.filter(tmdb_id__isnull=True, imdb_id__isnull=True):
+                    cleaned = self._strip_provider_tags(r.name)
+                    mark = (r.custom_properties or {}).get(MARK) if isinstance(r.custom_properties, dict) else None
+                    if cleaned or (mark and mark.get("applied_name") == r.name):  # the second: tidied earlier
+                        title, year = cleaned or (r.name, None)
+                        loose.append((r, title, year or self._title_year(r)))
+                if not loose:
+                    continue
+                found = self._search_titles({(ctype, t, y) for _r, t, y in loose if y}, settings, log)
+                linked = {}
+                for pk, name, year, lang in (model.objects.filter(Q(tmdb_id__isnull=False) | Q(imdb_id__isnull=False))
+                                             .values_list("id", "name", "year", "language")):
+                    linked.setdefault((self._same_title_key(name), year, lang or ""), []).append(pk)
+                for row, title, year in loose:
+                    matches = linked.get((self._same_title_key(title), year, row.language or ""), []) if year else []
+                    keep = model.objects.filter(pk=matches[0]).first() if len(matches) == 1 else None
+                    if keep and not self._same_length(keep, row):
+                        keep = None  # a different film with the same name and year
+                    tmdb_id, official = found.get((ctype, title, year)) or (None, None)
+                    if not keep and tmdb_id:
+                        keep = model.objects.filter(tmdb_id=tmdb_id, language=row.language or "").first()
+                        if keep and not self._same_length(keep, row):
+                            keep, tmdb_id = None, None
+                    new_name = self._format(official or title, year, fmt)[:255]
+                    keep = keep or (None if tmdb_id else model.objects.filter(
+                        name=new_name, year=row.year, language=row.language, tmdb_id__isnull=True,
+                        imdb_id__isnull=True).exclude(pk=row.pk).first())
+                    if dry:
+                        done["merged" if keep else "found" if official else "renamed"] += 1
+                        continue
+                    try:
+                        with transaction.atomic():
+                            if keep:
+                                _absorb_language_row(keep, row, rel, fk, refetch_episodes=ctype == "series")
+                                done["merged"] += 1
+                            else:
+                                cp = dict(row.custom_properties) if isinstance(row.custom_properties, dict) else {}
+                                mark = cp.get(MARK) or {}
+                                cp[MARK] = dict(mark, original_name=mark.get("original_name") or row.name,
+                                                applied_name=new_name, base_name=new_name, tag=None, imdb_id=None,
+                                                format=fmt, language=language, at=int(time.time()))
+                                change = {"tmdb_id": tmdb_id, "year": year} if tmdb_id else {}
+                                model.objects.filter(pk=row.pk).update(name=new_name, custom_properties=cp, **change)
+                                done["found" if official else "renamed"] += 1
+                    except (IntegrityError, ValueError) as exc:
+                        done["failed"] += 1
+                        if done["failed"] <= 3:
+                            log.warning("Could not tidy %s %s: %s", ctype, row.pk, exc)
+        finally:
+            _release_db_connections()
+        verb = "would be" if dry else ""
+        return (f"Titles with no ID: {done['merged']} {verb} joined to a matching title, {done['found']} {verb} matched on"
+                f" TMDB, {done['renamed']} {verb} only cleaned"
+                f"{', ' + str(done['failed']) + ' failed' if done['failed'] else ''}.").replace("  ", " ")
 
     # --- rename run -------------------------------------------------------------
 
@@ -426,7 +611,7 @@ class Plugin:
 
     # --- duplicates ----------------------------------------------------------------
 
-    # Provider prefix before " - ": "EN - Zero Day (2025) (US)" -> "EN", "4K-D+ - Zootopia+" -> "4K-D+".
+    # Provider prefix before " - ": "EN - Movie Title (2025) (US)" -> "EN", "4K-D+ - Movie Title" -> "4K-D+".
     _PREFIX = __import__("re").compile(r"^\s*([A-Za-z0-9+&|!]+(?:-[A-Za-z0-9+&|!]+)*)\s+-\s+\S")
     _FOURK = __import__("re").compile(r"^4K[-\s]*", __import__("re").I)
 
@@ -452,7 +637,7 @@ class Plugin:
         """Rows sharing a TMDB ID (Dispatcharr keeps one row per language, and some
         providers' categories split a title into an '' and an untagged language row)
         all end up with the same clean name. Give each a short provider tag:
-        "Zero Day [EN]" / "Zero Day [NF]"."""
+        "Movie Title [EN]" / "Movie Title [NF]"."""
         import logging
 
         from django.db import IntegrityError, transaction
@@ -478,7 +663,7 @@ class Plugin:
                     tags = self._tags_for([m.get("original_name") for m in marks])
                     known = [t for t in tags if t]
                     if len(known) != len(set(known)) or not known:
-                        # e.g. the provider lists "EN - Ghosts (2021) (US)" twice: a tag
+                        # e.g. the provider lists "EN - Show Title (2021) (US)" twice: a tag
                         # can't tell those rows apart, so don't add one.
                         tags = [None] * len(rows)
                         res["ambiguous"] += 1
@@ -599,12 +784,13 @@ class Plugin:
         except Exception:  # noqa: BLE001
             return None
 
-    def _wait_for_vod_scan(self, account, since, log):
+    def _wait_for_vod_scan(self, account, since, log, seen_since=None):
         from apps.vod.models import M3UMovieRelation, M3USeriesRelation
 
         st = {"running": True, "action": "waiting", "account": account.name, "started": time.time(), "stopped": False}
         self.state.flag(self.state.stop_path, False)
         seen = False
+        scanned_after = _aware(seen_since or since)
         while time.time() - since < self.VOD_WAIT_MAX:
             if self.state.has(self.state.stop_path):
                 st.update(running=False, stopped=True, finished=time.time())
@@ -617,6 +803,10 @@ class Plugin:
                 seen = True
             elif seen:
                 return True  # it ran and is done
+            elif running is False and any(rel.objects.filter(m3u_account=account, last_seen__gte=scanned_after).exists()
+                                          for rel in (M3UMovieRelation, M3USeriesRelation)):
+                log.info("VOD scan of %s already finished; renaming now.", account.name)
+                return True
             elif time.time() - since > self.VOD_WAIT_START:
                 # Never saw it: it may have finished before we looked (the scan marks every
                 # title it sees), or the workers can't be asked. Go ahead either way.
@@ -642,12 +832,15 @@ class Plugin:
             self._pending(add=account.id)
             return {"status": "ok", "message": f"{account.name}: a run is in progress; queued for after it."}
         since = time.time()
+        seen_since = None
         messages = []
         while account is not None:
-            if not self._wait_for_vod_scan(account, since, log):
+            if not self._wait_for_vod_scan(account, since, log, seen_since):
                 self._pending(add=account.id)  # stopped (e.g. plugin reloaded): do it next time
                 messages.append(f"{account.name}: stopped while waiting for its VOD scan; queued for the next refresh.")
                 break
+            if settings.get("tidy_no_id"):  # before sorting, so joined titles sort by their ID
+                messages.append(self._tidy_no_id(settings))
             messages.append(self._group_categories(settings, notify=False)["message"])
             if settings.get("language_filter"):  # before renaming, so removed titles aren't renamed first
                 messages.append(self._language_filter(settings, remove=True, notify=False)["message"])
@@ -661,6 +854,7 @@ class Plugin:
 
                 account = M3UAccount.objects.filter(pk=nxt[0]).first()
                 since = time.time() - 60  # its scan was queued a while ago
+                seen_since = since - self.state.STALE_SECONDS  # and may have ended during the last run
         return {"status": "ok", "message": "\n".join(messages) or "Nothing to do."}
 
     # --- images ---------------------------------------------------------------------
@@ -1041,10 +1235,12 @@ class Plugin:
     PLATFORM_TTL = 30 * 86400  # services change their catalogue: look titles up again after ~a month
 
     # Last-resort services: only chosen when no other listed service streams the title
-    # (Outlander, a Starz original, also streams on Netflix: it goes to Netflix), and titles
+    # (a Starz original that also streams on Netflix goes to Netflix), and titles
     # filed under them by a provider are still looked up. "Premium Cable" is the providers'
     # mixed Showtime/Starz/AMC+/MGM+/OSN+ group; it keeps what TMDB can't place.
     SOFT_PLATFORMS = {"Starz", "AMC+", "MGM+", "Premium Cable"}
+    SEARCH_CACHE = "title_search.json"
+    _SEARCH_TAIL = __import__("re").compile(r"\s*\(Movie Version\)", __import__("re").I)
     KIDS_CACHE = "kids_ratings.json"
     TEEN_ABROAD = {"GB": {"12", "12A", "15", "18"}, "AU": {"M", "MA15+", "MA 15+", "R18+", "R 18+"},
                    "DE": {"12", "16", "18"}, "FR": {"12", "16", "18"}, "BR": {"12", "14", "16", "18"},
@@ -1224,15 +1420,15 @@ class Plugin:
     def _pick_platform(self, networks, flatrate, order, free=()):
         """The selected service a title belongs to, else "". Only selected services count,
         and the first one selected wins, paid or free, except that a title free with ads on
-        Prime Video goes there (Death Note: on Netflix too, but played free on Prime Video)."""
+        Prime Video goes there, even if a service higher in the order has it too."""
         nets = [self._map_service(n) for n in networks]
-        for p in nets:  # a series' original network decides first (Dexter: Resurrection -> Paramount+)
+        for p in nets:  # a series' original network decides first (a Paramount+ original -> Paramount+)
             if p in order and p not in self.SOFT_PLATFORMS:
                 return p
         if "Prime Video" in order and any(" ".join(x.casefold().split()) == self.PRIME_FREE for x in free):
             return "Prime Video"
         found = {self._service_key(x) for x in (*flatrate, *free)} | {self._service_key(n) for n in nets if n}
-        listed = [p for p in order if self._service_key(p) in found]  # Outlander (Starz) -> Netflix
+        listed = [p for p in order if self._service_key(p) in found]  # a Starz original on Netflix -> Netflix
         return next((p for p in listed if p not in self.SOFT_PLATFORMS), next(iter(listed), ""))
 
     @staticmethod
@@ -1364,7 +1560,7 @@ class Plugin:
     def _is_mature(cls, kind, d):
         """True if TMDB's answer shows a title for older viewers: a teen or adult US rating and
         no Kids or Family genre, or for a series, teen ratings in three or more other countries
-        (King of the Hill: TV-PG and Family on TMDB, but 12 in the UK, France and Germany).
+        (a TV-PG Family show on TMDB can still be rated 12 in the UK, France and Germany).
         A title with neither stays with its provider's label."""
         if kind != "movie":
             rows = (d.get("content_ratings") or {}).get("results") or []
@@ -1616,7 +1812,7 @@ class Plugin:
                             unmatched_titles.add(title)
                         t = p or t
                     if t and title in mature and t.casefold().endswith(" kids") and self._platform_name(t, order):
-                        t = t[:-5].strip()  # a provider's kids category, but not a kids title (Death Note)
+                        t = t[:-5].strip()  # a provider's kids category, but not a kids title
                     want = target_id(t) if t else o
                     if t:
                         keep_orig[rid] = o

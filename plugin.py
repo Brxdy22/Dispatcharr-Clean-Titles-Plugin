@@ -24,6 +24,7 @@ Runs in a Celery worker (the click only queues it): a full pass over tens of
 thousands of titles takes longer than a web request may wait.
 """
 import json
+import logging
 import os
 import threading
 import time
@@ -115,15 +116,55 @@ class _State:
         return os.path.exists(path)
 
 
+def _service_list(value):
+    """Service names from a multi-select list, or comma-separated text from before it."""
+    items = value.split(",") if isinstance(value, str) else value or []
+    return [x.strip() for x in items if x.strip()]
+
+
 class Plugin:
     name = _MANIFEST["name"]
     version = _MANIFEST["version"]
     description = _MANIFEST["description"]
     author = _MANIFEST["author"]
 
+    @property
+    def fields(self):
+        """Manifest fields with their lists filled, read when the plugin loads."""
+        fields = json.loads(json.dumps(_MANIFEST["fields"]))
+        try:
+            settings = self._saved_settings()
+        except Exception:
+            settings = {}
+        services = self._region_services(settings)
+        for field in fields:
+            saved = settings.get(field["id"])
+            if field["id"] in ("language", "platform_region") and saved:
+                if str(saved).strip() not in {o["value"] for o in field["options"]}:
+                    field["options"].append({"value": str(saved).strip(), "label": str(saved).strip()})
+            elif field["id"] == "platform_order":
+                # Saved services stay offered: Dispatcharr refuses to save a multi-select
+                # holding a value it doesn't offer.
+                names = dict.fromkeys([*services, *field["default"], *_service_list(saved)])
+                field["options"] = [{"value": n, "label": n} for n in names]
+        return fields
+
+    @staticmethod
+    def _saved_settings():
+        """Saved settings, moving a service order saved as text to a list: the settings
+        page crashes on text in a multi-select."""
+        from apps.plugins.models import PluginConfig
+
+        config = PluginConfig.objects.filter(key="clean_titles").first()
+        settings = (config.settings if config else None) or {}
+        if isinstance(settings.get("platform_order"), str):
+            settings["platform_order"] = _service_list(settings["platform_order"])
+            config.save(update_fields=["settings"])
+        return settings
+
     _BACKGROUND = {"rename_run": "Rename Run", "revert_all": "Revert All Renames", "tag_duplicates": "Tag Duplicates",
                    "unify_series": "Unify Series", "revert_unify": "Revert Unify", "fix_images": "Fix Images",
-                   "group_categories": "Category Groups", "revert_groups": "Revert Category Groups"}
+                   "group_categories": "Streaming Categories", "revert_groups": "Revert Streaming Categories"}
 
     def __init__(self):
         self.state = _State()
@@ -869,7 +910,7 @@ class Plugin:
         self._notify(summary, st.get("stopped") or st.get("failed"), title=title)
         return {"status": "ok", "message": summary}
 
-    # --- category groups ------------------------------------------------------------
+    # --- streaming categories ------------------------------------------------------------
     # Providers spread one service over many categories ("NETFLIX MOVIES", "|EN| NETFLIX",
     # "NETFLIX MOVIES 4K ..."). A title's category is stored on each provider's relation
     # to it, so grouping re-points those relations at one shared category per group.
@@ -881,6 +922,7 @@ class Plugin:
     # streams. The provider category of every moved relation is kept for the revert.
 
     GROUPS_FILE = "category_groups.json"
+    CATCH_ALL = "Other"  # never a category: its titles go to a service or the fallback
 
     @staticmethod
     def _default(field_id):
@@ -892,6 +934,12 @@ class Plugin:
 
         # NFKC turns the providers' superscript tags ("⁴ᴷ ³⁸⁴⁰ᴾ") into plain "4K 3840P".
         return " ".join(unicodedata.normalize("NFKC", s or "").casefold().split())
+
+    @staticmethod
+    def _category_map():
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "category_map.txt")
+        with open(path, encoding="utf-8") as f:
+            return f.read()
 
     def _parse_groups(self, text):
         """[movies]/[series] sections of 'Group name = pattern, pattern' lines.
@@ -924,6 +972,12 @@ class Plugin:
             if any(fnmatch.fnmatchcase(n, p) for p in pats):
                 return target
         return None
+
+    def _source_group(self, name, rules, keep):
+        """What a provider category sorts as: its line in the map, else the catch-all, so a
+        category the map doesn't know yet can't stay as a category. None leaves it alone."""
+        target = self._group_of(name, rules) or self.CATCH_ALL
+        return None if name in keep or name == target else target
 
     def _groups_data(self, data=None):
         path = os.path.join(self.state.dir, self.GROUPS_FILE)
@@ -995,8 +1049,8 @@ class Plugin:
             return "Prime Video"
         return None
 
-    # Other services TMDB lists get their own category too (when big enough). Variants of one
-    # service share a key; live-TV bundles and cable-login channel apps are not catalogues.
+    # The other services TMDB lists, offered in the service list. Variants of one service
+    # share a key; live-TV bundles and cable-login channel apps are not catalogues.
     _EXTRA_ALIASES = {
         "hallmarktv": "Hallmark+", "hallmark+": "Hallmark+", "hallmarkplus": "Hallmark+",
         "pureflix": "Great American Pure Flix", "greatamericanpureflix": "Great American Pure Flix",
@@ -1021,6 +1075,72 @@ class Plugin:
         "tlc", "amc", "vicetv", "foodnetwork", "discoverygo", "nickelodeon", "cartoonnetwork",
     }
 
+    # Pay-per-title stores: TMDB lists them as providers, but only subscription and free
+    # listings decide a title's service, so picking one would do nothing.
+    _STORES = {"amazonvideo", "appletvstore", "googleplaymovies", "justwatchtvstore", "fandango"}
+    SERVICE_CACHE = "region_services.json"
+    SERVICE_TTL = 30 * 86400
+
+    def _service_names(self, results, region):
+        """Service names from TMDB's provider lists, most popular first. One entry per
+        service, named as the order setting needs them."""
+        import re
+
+        best = {}
+        for row in results:
+            raw = row.get("provider_name")
+            name = self._map_service(raw) or self._canon(raw)[1]
+            key = re.sub(r"[^a-z0-9+]", "", (name or "").casefold())
+            if not key or key in self._STORES:
+                continue
+            rank = (row.get("display_priorities") or {}).get(region, row.get("display_priority", 9999))
+            if key not in best or rank < best[key][0]:
+                best[key] = (rank, name)
+        return [name for _, name in sorted(best.values(), key=lambda item: (item[0], item[1].casefold()))]
+
+    @staticmethod
+    def _fetch_services(key, region):
+        """TMDB's provider rows for a region, movies and series together."""
+        import requests
+
+        params, headers = {"watch_region": region}, {"Accept": "application/json"}
+        if key.startswith("eyJ"):
+            headers["Authorization"] = f"Bearer {key}"
+        else:
+            params["api_key"] = key
+        rows = []
+        for kind in ("movie", "tv"):
+            reply = requests.get(f"{TMDB}/watch/providers/{kind}", params=params, headers=headers, timeout=5)
+            reply.raise_for_status()
+            rows += reply.json().get("results") or []
+        return rows
+
+    def _region_services(self, settings):
+        """The region's services, from TMDB at most once a month per region. Runs while the
+        plugin loads, so any failure just leaves the last list, or none."""
+        region = (settings.get("platform_region") or self._default("platform_region") or "US").strip().upper()
+        path = os.path.join(self.state.dir, self.SERVICE_CACHE)
+        try:
+            with open(path, encoding="utf-8") as f:
+                cache = json.load(f)
+        except (OSError, ValueError):
+            cache = {}
+        entry = cache.get(region) or {}
+        key = (settings.get("tmdb_api_key") or "").strip()
+        if not key or time.time() - entry.get("at", 0) < self.SERVICE_TTL:
+            return entry.get("names") or []
+        try:
+            names = self._service_names(self._fetch_services(key, region), region)
+            cache[region] = {"at": time.time(), "names": names}
+            tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"  # loads can overlap
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(cache, f)
+            os.replace(tmp, path)
+            return names
+        except Exception as e:  # the message can hold the request URL, and with it the API key
+            logging.getLogger(LOGGER_NAME).warning("Could not list streaming services: %s", type(e).__name__)
+            return entry.get("names") or []
+
     def _canon(self, raw):
         """(key, display name) of a service TMDB lists that isn't one of the named ones, else (None, None)."""
         import re
@@ -1043,61 +1163,26 @@ class Plugin:
         memo[raw] = (key, self._EXTRA_ALIASES.get(key, name))
         return memo[raw]
 
-    def _rank_extras(self, entries, order, min_titles):
-        """Other services that get a category: ranked by how many titles list them (paid before
-        free), dropping the smallest until each keeps at least min_titles titles."""
-        from collections import Counter, defaultdict
+    def _service_key(self, raw):
+        """One spelling-proof key per service, so TMDB's names match the selected ones."""
+        import re
 
-        paid, free, names = Counter(), Counter(), defaultdict(Counter)
-        for e in entries:
-            for lst, ctr in ((e[3], paid), (e[4], free)):
-                seen = set()
-                for raw in lst:
-                    key, name = self._canon(raw)
-                    if key and key not in seen:
-                        seen.add(key)
-                        ctr[key] += 1
-                        names[key][name] += 1
-        # aliases share one display name: rank and count by display name
-        disp = {k: (self._EXTRA_ALIASES.get(k) or names[k].most_common(1)[0][0]) for k in names}
-        by_name_paid, by_name_free = Counter(), Counter()
-        for k, n in paid.items():
-            by_name_paid[disp[k]] += n
-        for k, n in free.items():
-            by_name_free[disp[k]] += n
-        # Bigger services first, paid and free alike (About Schmidt: The Roku Channel over Howdy);
-        # one named in the service order setting goes ahead, in that order.
-        total = by_name_paid + by_name_free
-        ranked = sorted(total, key=lambda n: (order.index(n) if n in order else len(order), -total[n], n))
-        # a service listed on fewer titles than the minimum can never reach it
-        rank = {n: i for i, n in enumerate(ranked) if by_name_paid[n] + by_name_free[n] >= min_titles}
-        self._extra_disp = disp
-        while True:
-            self._extras = rank
-            got = Counter(self._pick_platform(e[2], e[3], order, e[4]) for e in entries)
-            small = [n for n in rank if got[n] < min_titles]
-            if not small:
-                return rank
-            rank = {n: i for n, i in rank.items() if n != min(small, key=lambda n: got[n])}
+        memo = self.__dict__.setdefault("_key_memo", {})
+        if raw not in memo:
+            name = self._map_service(raw) or self._canon(raw)[1] or raw or ""
+            memo[raw] = re.sub(r"[^a-z0-9+]", "", name.casefold())
+        return memo[raw]
 
     def _pick_platform(self, networks, flatrate, order, free=()):
+        """The selected service a title belongs to, else "". Only selected services count,
+        and the first one selected wins, paid or free."""
         nets = [self._map_service(n) for n in networks]
         for p in nets:  # a series' original network decides first (Dexter: Resurrection -> Paramount+)
             if p in order and p not in self.SOFT_PLATFORMS:
                 return p
-        found = {self._map_service(x) for x in flatrate} | set(nets)  # Outlander (Starz) -> Netflix
-        p = next((p for p in order if p in found and p not in self.SOFT_PLATFORMS),
-                 next((p for p in order if p in found), ""))
-        if p:
-            return p
-        extras, disp = getattr(self, "_extras", {}), getattr(self, "_extra_disp", {})
-
-        def best(lst):
-            names = {disp.get(k) or n for k, n in (self._canon(x) for x in lst) if k}
-            return min((n for n in names if n in extras), key=lambda n: extras[n], default="")
-
-        ffound = {self._map_service(x) for x in free}  # a named service's free tier (Prime Video with ads)
-        return next((p for p in order if p in ffound), "") or best(list(flatrate) + list(free))
+        found = {self._service_key(x) for x in (*flatrate, *free)} | {self._service_key(n) for n in nets if n}
+        listed = [p for p in order if self._service_key(p) in found]  # Outlander (Starz) -> Netflix
+        return next((p for p in listed if p not in self.SOFT_PLATFORMS), next(iter(listed), ""))
 
     @staticmethod
     def _watch(session, key, kind, tmdb_id, region, limiter):
@@ -1201,11 +1286,8 @@ class Plugin:
             finally:
                 save()
         entries = [cache[ck(t)] for t in set(tmdb_of.values()) if len(cache.get(ck(t)) or []) >= 5]
-        min_titles = int(settings.get("extra_service_min_titles") or self._default("extra_service_min_titles") or 25)
-        self._rank_extras(entries, order, min_titles)
         for e in entries:
             e[0] = self._pick_platform(e[2], e[3], order, e[4])
-        st.setdefault("extras", {})[ctype] = sorted(self._extras, key=self._extras.get)
         return ({pk: cache[ck(t)][0] for pk, t in tmdb_of.items() if (cache.get(ck(t)) or [""])[0]},
                 tmdb_of)
 
@@ -1262,17 +1344,16 @@ class Plugin:
 
         log = logging.getLogger(LOGGER_NAME)
         dry = bool(settings.get("dry_run", True))
-        text = settings.get("category_groups")
-        rules, errors = self._parse_groups(self._default("category_groups") if text is None else text)
-        sort_platforms = bool(settings.get("sort_by_platform", self._default("sort_by_platform")))
-        order = [x.strip() for x in (settings.get("platform_order") or self._default("platform_order") or "").split(",")
-                 if x.strip()]
+        rules, errors = self._parse_groups(self._category_map())
+        saved = settings.get("platform_order")
+        order = _service_list(self._default("platform_order") if saved is None else saved)
         fallback = lambda k: (settings.get(k) if settings.get(k) is not None else self._default(k) or "").strip()  # noqa: E731
-        theaters, unmatched = fallback("theaters_group"), fallback("unmatched_group")
-        now_playing = self._now_playing(settings, log) if sort_platforms and theaters else set()
+        theaters = fallback("theaters_group")
+        unmatched = (settings.get("unmatched_group") or "").strip() or self._default("unmatched_group")
+        now_playing = self._now_playing(settings, log) if theaters else set()
         st = {"running": True, "action": "group_categories", "dry_run": dry, "started": time.time(),
               "errors": errors[:5], "types": {}, "stopped": False}
-        if not (rules["movie"] or rules["series"]):
+        if not order:
             st.update(running=False, finished=time.time(), off=True)
             self.state.write(st)
             return {"status": "ok", "message": self._describe(st)}
@@ -1292,10 +1373,11 @@ class Plugin:
                 used = {n: i for n, i in data.setdefault("used", {}).get(ctype, {}).items()
                         if vm.VODCategory.objects.filter(id=i).exists()}
                 cats = {c.id: c.name for c in vm.VODCategory.objects.filter(category_type=ctype).exclude(id__in=ours)}
+                keep = {unmatched, theaters, *order}
                 src_target = {}
                 for cid, cname in cats.items():
-                    t = self._group_of(cname, rules[ctype])
-                    if t and cname != t:
+                    t = self._source_group(cname, rules[ctype], keep)
+                    if t:
                         src_target[cid] = t
 
                 def target_id(t):
@@ -1330,24 +1412,21 @@ class Plugin:
                 # Titles in a genre or catch-all group go to their streaming service: the one a
                 # provider already files them under (a service group), else the one TMDB names.
                 platform_of = {}
-                if sort_platforms:
-                    for _rid, _cur, title, o in rows:
-                        p = self._platform_name(src_target.get(o), order)
-                        if p:
-                            platform_of.setdefault(title, p)
-                    need = {title for _rid, _cur, title, o in rows
-                            if src_target.get(o) and not self._platform_name(src_target[o], order)
-                            and title not in platform_of}
-                    found, tmdb_of = self._platforms_for(ctype, need, settings, order, st, log)
-                    platform_of.update(found)
-                else:
-                    tmdb_of = {}
+                for _rid, _cur, title, o in rows:
+                    p = self._platform_name(src_target.get(o), order)
+                    if p:
+                        platform_of.setdefault(title, p)
+                need = {title for _rid, _cur, title, o in rows
+                        if src_target.get(o) and not self._platform_name(src_target[o], order)
+                        and title not in platform_of}
+                found, tmdb_of = self._platforms_for(ctype, need, settings, order, st, log)
+                platform_of.update(found)
                 rule_names = {t for t, _ in rules[ctype]}
                 sorted_titles, theater_titles, unmatched_titles = set(), set(), set()
 
                 for rid, cur, title, o in rows:
                     t = src_target.get(o)  # None: its rule is gone, back to the provider category
-                    if t and sort_platforms and not self._platform_name(t, order):
+                    if t and not self._platform_name(t, order):
                         p = platform_of.get(title)
                         if p:
                             p = f"{p} Kids" if "kids" in t.casefold() and f"{p} Kids" in rule_names else p
@@ -1356,8 +1435,8 @@ class Plugin:
                         elif theaters and ctype == "movie" and str(tmdb_of.get(title)) in now_playing:
                             p = theaters  # still in cinemas, not streaming anywhere yet
                             theater_titles.add(title)
-                        elif unmatched:
-                            p = unmatched  # on no streaming service (or not on TMDB at all)
+                        else:
+                            p = unmatched  # on none of the selected services (or not on TMDB at all)
                             unmatched_titles.add(title)
                         t = p or t
                     want = target_id(t) if t else o
@@ -1404,7 +1483,7 @@ class Plugin:
                                       "unmatched": len(unmatched_titles)}
                 self.state.write(st)
         except Exception as exc:  # noqa: BLE001
-            log.exception("Category groups failed")
+            log.exception("Streaming categories failed")
             st["failed"] = str(exc)
         finally:
             _release_db_connections()
@@ -1412,10 +1491,10 @@ class Plugin:
         st["finished"] = time.time()
         self.state.write(st)
         summary = self._describe(st)
-        log.info("Category groups finished: %s", summary.replace("\n", " | "))
+        log.info("Streaming categories finished: %s", summary.replace("\n", " | "))
         if notify:
             self._notify(summary, bool(st.get("failed")),
-                         title="Clean Titles: categories grouped" if not dry else "Clean Titles: category groups (dry run)")
+                         title="Clean Titles: streaming categories applied" if not dry else "Clean Titles: streaming categories (dry run)")
         return {"status": "ok", "message": summary}
 
     def _revert_groups(self):
@@ -1458,11 +1537,11 @@ class Plugin:
                 data["orig"][ctype] = {}
                 self._groups_data(data)
         except Exception as exc:  # noqa: BLE001
-            log.exception("Revert category groups failed")
+            log.exception("Revert streaming categories failed")
             st["failed"] = str(exc)
         finally:
             _release_db_connections()
-        return self._finish(st, log, "Revert category groups", "Clean Titles: category groups reverted")
+        return self._finish(st, log, "Revert streaming categories", "Clean Titles: streaming categories reverted")
 
     # --- revert -----------------------------------------------------------------
 
@@ -1521,9 +1600,9 @@ class Plugin:
             return f"Waiting for the VOD scan of {st.get('account')} to finish, then its new titles get renamed."
         if st.get("action") == "group_categories":
             if st.get("off"):
-                return "Category groups are off (the Category groups box is empty)."
+                return "Streaming categories are off (no streaming services are selected)."
             dry = st.get("dry_run")
-            lines = [f"Category groups {'dry run ' if dry else ''}{state}."]
+            lines = [f"Streaming categories {'dry run ' if dry else ''}{state}."]
             for ctype, label in (("movie", "Movies"), ("series", "Series")):
                 t = (st.get("types") or {}).get(ctype)
                 if t:
@@ -1549,7 +1628,7 @@ class Plugin:
                 lines.append(f"Failed: {st['failed']}")
             return "\n".join(lines).replace("  ", " ")
         if st.get("action") == "revert_groups":
-            return (f"Revert category groups {state}: {st.get('reverted', 0)} titles back in their provider categories"
+            return (f"Revert streaming categories {state}: {st.get('reverted', 0)} titles back in their provider categories"
                     f"{', ' + str(st['left']) + ' left for the next refresh to reset' if st.get('left') else ''}"
                     f"{'. Failed: ' + st['failed'] if st.get('failed') else ''}.")
         if st.get("action") == "fix_images":

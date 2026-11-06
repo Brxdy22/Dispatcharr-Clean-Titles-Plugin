@@ -1014,6 +1014,14 @@ class Plugin:
     # filed under them by a provider are still looked up. "Premium Cable" is the providers'
     # mixed Showtime/Starz/AMC+/MGM+/OSN+ group; it keeps what TMDB can't place.
     SOFT_PLATFORMS = {"Starz", "AMC+", "MGM+", "Premium Cable"}
+    KIDS_CACHE = "kids_ratings.json"
+    TEEN_ABROAD = {"GB": {"12", "12A", "15", "18"}, "AU": {"M", "MA15+", "MA 15+", "R18+", "R 18+"},
+                   "DE": {"12", "16", "18"}, "FR": {"12", "16", "18"}, "BR": {"12", "14", "16", "18"},
+                   "CA": {"14+", "18+"}, "NL": {"12", "14", "16", "18"}}
+    KIDS_GENRES = {10751, 10762}  # TMDB's Family and Kids
+    MATURE_RATINGS = {"TV-14", "TV-MA", "PG-13", "R", "NC-17"}
+    YOUNG_RATINGS = {"TV-Y", "TV-Y7", "TV-Y7-FV", "TV-G", "TV-PG", "G", "PG"}
+    PRIME_FREE = "amazon prime video free with ads"  # TMDB's free tier, not its "Amazon Prime Video with Ads" plan
 
     @classmethod
     def _platform_name(cls, group, order):
@@ -1184,11 +1192,14 @@ class Plugin:
 
     def _pick_platform(self, networks, flatrate, order, free=()):
         """The selected service a title belongs to, else "". Only selected services count,
-        and the first one selected wins, paid or free."""
+        and the first one selected wins, paid or free, except that a title free with ads on
+        Prime Video goes there (Death Note: on Netflix too, but played free on Prime Video)."""
         nets = [self._map_service(n) for n in networks]
         for p in nets:  # a series' original network decides first (Dexter: Resurrection -> Paramount+)
             if p in order and p not in self.SOFT_PLATFORMS:
                 return p
+        if "Prime Video" in order and any(" ".join(x.casefold().split()) == self.PRIME_FREE for x in free):
+            return "Prime Video"
         found = {self._service_key(x) for x in (*flatrate, *free)} | {self._service_key(n) for n in nets if n}
         listed = [p for p in order if self._service_key(p) in found]  # Outlander (Starz) -> Netflix
         return next((p for p in listed if p not in self.SOFT_PLATFORMS), next(iter(listed), ""))
@@ -1271,6 +1282,8 @@ class Plugin:
             e = cache.get(ck(t)) or [None, 0]
             if now - e[1] > self.PLATFORM_TTL + (int(t) % 7 if str(t).isdigit() else 0) * 86400:
                 return True
+            if len(e) < 5:  # from before TMDB's full answer was kept: it can't be re-decided
+                return True
             return want_stores and len(e) == 5 and not self._pick_platform(e[2], e[3], order, e[4])
 
         todo = sorted({t for t in tmdb_of.values() if stale(t)})
@@ -1315,6 +1328,106 @@ class Plugin:
         in_store = {pk for pk, t in tmdb_of.items() if self._store_only(cache.get(ck(t)))}
         return ({pk: cache[ck(t)][0] for pk, t in tmdb_of.items() if (cache.get(ck(t)) or [""])[0]},
                 tmdb_of, in_store)
+
+    @classmethod
+    def _is_mature(cls, kind, d):
+        """True if TMDB's answer shows a title for older viewers: a teen or adult US rating and
+        no Kids or Family genre, or for a series, teen ratings in three or more other countries
+        (King of the Hill: TV-PG and Family on TMDB, but 12 in the UK, France and Germany).
+        A title with neither stays with its provider's label."""
+        if kind != "movie":
+            rows = (d.get("content_ratings") or {}).get("results") or []
+            if len({r.get("iso_3166_1") for r in rows
+                    if r.get("rating") in cls.TEEN_ABROAD.get(r.get("iso_3166_1"), ())}) >= 3:
+                return True
+        if any(g.get("id") in cls.KIDS_GENRES for g in d.get("genres") or []):
+            return False
+        if kind == "movie":
+            ratings = {c.get("certification") for r in (d.get("release_dates") or {}).get("results") or []
+                       if r.get("iso_3166_1") == "US" for c in r.get("release_dates") or []}
+        else:
+            ratings = {r.get("rating") for r in (d.get("content_ratings") or {}).get("results") or []
+                       if r.get("iso_3166_1") == "US"}
+        return bool(ratings & cls.MATURE_RATINGS) and not ratings & cls.YOUNG_RATINGS
+
+    @classmethod
+    def _mature_info(cls, session, key, kind, tmdb_id, limiter):
+        """Whether TMDB shows this title is for older viewers. False if TMDB has no such title."""
+        url = f"{TMDB}/{'movie' if kind == 'movie' else 'tv'}/{str(tmdb_id).strip('/')}"
+        params = {"append_to_response": "release_dates" if kind == "movie" else "content_ratings"}
+        headers = {"Accept": "application/json"}
+        if key.startswith("eyJ"):
+            headers["Authorization"] = f"Bearer {key}"
+        else:
+            params["api_key"] = key
+        for attempt in range(4):
+            limiter.wait()
+            r = session.get(url, params=params, headers=headers, timeout=15)
+            if r.status_code == 429:
+                time.sleep(float(r.headers.get("Retry-After", 2)) + attempt)
+                continue
+            if r.status_code == 404:
+                return False
+            if r.status_code == 401:
+                raise PermissionError("TMDB rejected the API key (401).")
+            r.raise_for_status()
+            return cls._is_mature(kind, r.json())
+        raise RuntimeError("TMDB kept rate-limiting (429).")
+
+    def _mature_titles(self, ctype, title_ids, settings, st, log):
+        """Those of these titles, all in a provider's kids category, that aren't for kids. A title
+        that can't be looked up stays in the kids category."""
+        import requests
+        from apps.vod.models import Movie, Series
+
+        if not title_ids:
+            return set()
+        model = Movie if ctype == "movie" else Series
+        path = os.path.join(self.state.dir, self.KIDS_CACHE)
+        try:
+            with open(path, encoding="utf-8") as f:
+                cache = json.load(f)
+        except (OSError, ValueError):
+            cache = {}
+        ids = list(title_ids)
+        tmdb_of = {}
+        for i in range(0, len(ids), 5000):
+            tmdb_of.update((pk, t) for pk, t in model.objects.filter(id__in=ids[i:i + 5000])
+                           .exclude(tmdb_id__isnull=True).exclude(tmdb_id="").values_list("id", "tmdb_id"))
+        now = time.time()
+        ck = lambda t: f"{ctype}:{t}"  # noqa: E731
+        todo = sorted({t for t in tmdb_of.values() if now - (cache.get(ck(t)) or [False, 0])[1] > self.PLATFORM_TTL})
+        key = (settings.get("tmdb_api_key") or "").strip()
+        pst = st.setdefault("platform", {"looked_up": 0, "to_look_up": 0, "errors": 0})
+        if todo and key:
+            pst["to_look_up"] += len(todo)
+            limiter = _RateLimiter(settings.get("requests_per_second") or 20)
+            session = requests.Session()
+            log.info("Looking up the ratings of %d %s in kids categories on TMDB", len(todo), ctype)
+            try:
+                with ThreadPoolExecutor(max_workers=8) as pool:
+                    futures = {pool.submit(self._mature_info, session, key, ctype, t, limiter): t for t in todo}
+                    for fut in as_completed(futures):
+                        pst["looked_up"] += 1
+                        try:
+                            cache[ck(futures[fut])] = [fut.result(), time.time()]
+                        except PermissionError as exc:
+                            pst["error"] = str(exc)
+                        except Exception as exc:  # noqa: BLE001 - counted; looked up again next time
+                            pst["errors"] += 1
+                            if pst["errors"] <= 3:
+                                log.warning("Rating lookup %s %s failed: %s", ctype, futures[fut], str(exc).replace(key, "***"))
+                        stopped = self.state.has(self.state.stop_path)
+                        if pst.get("error") or stopped:
+                            st["stopped"] = st["stopped"] or stopped
+                            for f in futures:
+                                f.cancel()
+                            break
+            finally:
+                with open(path + ".tmp", "w", encoding="utf-8") as f:
+                    json.dump(cache, f)
+                os.replace(path + ".tmp", path)
+        return {pk for pk, t in tmdb_of.items() if (cache.get(ck(t)) or [False])[0]}
 
     def _now_playing(self, settings, log):
         """TMDB ids of the movies TMDB lists as now playing in the region's cinemas (cached 12 h)."""
@@ -1447,6 +1560,9 @@ class Plugin:
                         and title not in platform_of}
                 found, tmdb_of, in_store = self._platforms_for(ctype, need, settings, order, st, log, want_stores=bool(rent_buy))
                 platform_of.update(found)
+                mature = self._mature_titles(ctype, {title for _rid, _cur, title, o in rows
+                                                     if "kids" in (src_target.get(o) or "").casefold()},
+                                             settings, st, log)
                 rule_names = {t for t, _ in rules[ctype]}
                 sorted_titles, theater_titles, rent_titles, unmatched_titles = set(), set(), set(), set()
 
@@ -1468,6 +1584,8 @@ class Plugin:
                             p = unmatched  # on none of the selected services (or not on TMDB at all)
                             unmatched_titles.add(title)
                         t = p or t
+                    if t and title in mature and t.casefold().endswith(" kids") and self._platform_name(t, order):
+                        t = t[:-5].strip()  # a provider's kids category, but not a kids title (Death Note)
                     want = target_id(t) if t else o
                     if t:
                         keep_orig[rid] = o

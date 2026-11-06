@@ -189,6 +189,42 @@ class RentBuy(unittest.TestCase):
     def test_store_listings_never_pick_a_service(self):
         self.assertEqual(p.Plugin()._pick_platform([], [], ["Prime Video"], []), "")
 
+    def test_a_teen_rating_without_a_kids_genre_is_not_for_kids(self):
+        mature = p.Plugin._is_mature
+        tv = lambda *r, genres=(): {"genres": [{"id": g} for g in genres],  # noqa: E731
+                                    "content_ratings": {"results": [{"iso_3166_1": "US", "rating": x} for x in r]}}
+        self.assertTrue(mature("series", tv("TV-14", genres=[16])))
+        self.assertFalse(mature("series", tv("TV-14", genres=[10762])))
+        self.assertFalse(mature("series", tv("TV-Y7")))
+        self.assertFalse(mature("series", tv()))
+        movie = {"genres": [], "release_dates": {"results": [
+            {"iso_3166_1": "US", "release_dates": [{"certification": "R"}, {"certification": ""}]},
+            {"iso_3166_1": "DE", "release_dates": [{"certification": "PG"}]}]}}
+        self.assertTrue(mature("movie", movie))
+
+    def test_teen_ratings_in_three_countries_outweigh_a_family_label(self):
+        mature = p.Plugin._is_mature
+        rated = lambda *r: {"genres": [{"id": 10751}], "content_ratings": {"results": [  # noqa: E731
+            {"iso_3166_1": c, "rating": x} for c, x in r]}}
+        self.assertTrue(mature("series", rated(("US", "TV-PG"), ("GB", "12"), ("DE", "12"), ("FR", "12"))))
+        self.assertFalse(mature("series", rated(("US", "TV-PG"), ("GB", "12"), ("DE", "12"), ("FR", "0"))))
+
+    def test_free_with_ads_on_prime_video_beats_the_order(self):
+        free = ["Amazon Prime Video Free with Ads", "Tubi TV"]
+        order = ["Netflix", "Prime Video", "Tubi"]
+        self.assertEqual(p.Plugin()._pick_platform([], ["Netflix", "Amazon Prime Video"], order, free), "Prime Video")
+
+    def test_the_prime_ad_plan_and_other_free_services_keep_the_order(self):
+        order = ["Netflix", "Prime Video", "Tubi"]
+        plugin = p.Plugin()
+        self.assertEqual(plugin._pick_platform([], ["Netflix", "Amazon Prime Video with Ads"], order, []), "Netflix")
+        self.assertEqual(plugin._pick_platform([], ["Netflix"], order, ["Tubi TV"]), "Netflix")
+
+    def test_free_prime_needs_prime_selected_and_loses_to_the_network(self):
+        free = ["Amazon Prime Video Free with Ads"]
+        self.assertEqual(p.Plugin()._pick_platform([], ["Netflix"], ["Netflix"], free), "Netflix")
+        self.assertEqual(p.Plugin()._pick_platform(["Netflix"], [], ["Prime Video", "Netflix"], free), "Netflix")
+
     def test_only_store_listings_count(self):
         only = p.Plugin._store_only
         self.assertTrue(only(["", 0, [], [], [], ["Amazon Video"]]))

@@ -407,78 +407,130 @@ class Plugin:
 
     def _tidy_no_id(self, settings):
         """Titles with no TMDB or IMDb ID and a known provider prefix: joined to the one title of
-        the same name and year that has an ID, or to one already clean, else renamed."""
-        from django.db import IntegrityError, transaction
-        from django.db.models import Q
+        the same name and year that has an ID (a movie with no year: the one with the same name),
+        or to one already clean, else renamed. Then a joined title's poster is cleared from other
+        titles with no ID: the provider gives neighbouring titles one poster."""
         from apps.vod import models as vm
-        from apps.vod.tasks import _absorb_language_row
 
         log = logging.getLogger(LOGGER_NAME)
         dry = bool(settings.get("dry_run", True))
         scope = settings.get("scope") or "both"
-        fmt = settings.get("name_format") or "title"
-        language = (settings.get("language") or "en-US").strip()
-        done = {"merged": 0, "found": 0, "renamed": 0, "failed": 0}
+        done = {"merged": 0, "found": 0, "renamed": 0, "failed": 0, "ambiguous": 0, "posters": 0}
         try:
             for ctype, model, rel, fk in (("movie", vm.Movie, vm.M3UMovieRelation, "movie"),
                                           ("series", vm.Series, vm.M3USeriesRelation, "series")):
                 if scope not in ("both", "movies" if ctype == "movie" else "series"):
                     continue
-                loose = []
-                for r in model.objects.filter(tmdb_id__isnull=True, imdb_id__isnull=True):
-                    cleaned = self._strip_provider_tags(r.name)
-                    mark = (r.custom_properties or {}).get(MARK) if isinstance(r.custom_properties, dict) else None
-                    if cleaned or (mark and mark.get("applied_name") == r.name):  # the second: tidied earlier
-                        title, year = cleaned or (r.name, None)
-                        loose.append((r, title, year or self._title_year(r)))
-                if not loose:
-                    continue
-                found = self._search_titles({(ctype, t, y) for _r, t, y in loose if y}, settings, log)
-                linked = {}
-                for pk, name, year, lang in (model.objects.filter(Q(tmdb_id__isnull=False) | Q(imdb_id__isnull=False))
-                                             .values_list("id", "name", "year", "language")):
-                    linked.setdefault((self._same_title_key(name), year, lang or ""), []).append(pk)
-                for row, title, year in loose:
-                    matches = linked.get((self._same_title_key(title), year, row.language or ""), []) if year else []
-                    keep = model.objects.filter(pk=matches[0]).first() if len(matches) == 1 else None
-                    if keep and not self._same_length(keep, row):
-                        keep = None  # a different film with the same name and year
-                    tmdb_id, official = found.get((ctype, title, year)) or (None, None)
-                    if not keep and tmdb_id:
-                        keep = model.objects.filter(tmdb_id=tmdb_id, language=row.language or "").first()
-                        if keep and not self._same_length(keep, row):
-                            keep, tmdb_id = None, None
-                    new_name = self._format(official or title, year, fmt)[:255]
-                    keep = keep or (None if tmdb_id else model.objects.filter(
-                        name=new_name, year=row.year, language=row.language, tmdb_id__isnull=True,
-                        imdb_id__isnull=True).exclude(pk=row.pk).first())
-                    if dry:
-                        done["merged" if keep else "found" if official else "renamed"] += 1
-                        continue
-                    try:
-                        with transaction.atomic():
-                            if keep:
-                                _absorb_language_row(keep, row, rel, fk, refetch_episodes=ctype == "series")
-                                done["merged"] += 1
-                            else:
-                                cp = dict(row.custom_properties) if isinstance(row.custom_properties, dict) else {}
-                                mark = cp.get(MARK) or {}
-                                cp[MARK] = dict(mark, original_name=mark.get("original_name") or row.name,
-                                                applied_name=new_name, base_name=new_name, tag=None, imdb_id=None,
-                                                format=fmt, language=language, at=int(time.time()))
-                                change = {"tmdb_id": tmdb_id, "year": year} if tmdb_id else {}
-                                model.objects.filter(pk=row.pk).update(name=new_name, custom_properties=cp, **change)
-                                done["found" if official else "renamed"] += 1
-                    except (IntegrityError, ValueError) as exc:
-                        done["failed"] += 1
-                        if done["failed"] <= 3:
-                            log.warning("Could not tidy %s %s: %s", ctype, row.pk, exc)
+                gone = {}  # joined to another title: id -> (poster, title key)
+                try:
+                    self._tidy_rows(ctype, model, rel, fk, settings, dry, done, gone, log)
+                finally:
+                    done["posters"] += self._clear_shared_posters(model, gone, dry)
         finally:
             _release_db_connections()
         verb = "would be" if dry else ""
         return (f"Titles with no ID: {done['merged']} {verb} joined to a matching title, {done['found']} {verb} matched on"
                 f" TMDB, {done['renamed']} {verb} only cleaned"
+                f"{', ' + str(done['ambiguous']) + ' with no year left (several titles of that name)' if done['ambiguous'] else ''}"
+                f"{', ' + str(done['posters']) + ' shared posters ' + verb + ' cleared' if done['posters'] else ''}"
                 f"{', ' + str(done['failed']) + ' failed' if done['failed'] else ''}.").replace("  ", " ")
+
+    def _tidy_rows(self, ctype, model, rel, fk, settings, dry, done, gone, log):
+        """Joins or cleans one type's titles with no ID, counting into done. Those joined go in gone,
+        with their poster if the title they joined has an ID (so the poster is known to be theirs)."""
+        from django.db import IntegrityError, transaction
+        from django.db.models import Q
+        from apps.vod.tasks import _absorb_language_row
+
+        def joined(row, title, keep):  # read before the join, which clears row.pk
+            owned = keep.tmdb_id or keep.imdb_id
+            return {row.pk: (row.logo_id if owned else None, self._same_title_key(title))}
+
+        fmt = settings.get("name_format") or "title"
+        language = (settings.get("language") or "en-US").strip()
+        loose = []
+        for r in model.objects.filter(tmdb_id__isnull=True, imdb_id__isnull=True):
+            cleaned = self._strip_provider_tags(r.name)
+            mark = (r.custom_properties or {}).get(MARK) if isinstance(r.custom_properties, dict) else None
+            if cleaned or (mark and mark.get("applied_name") == r.name):  # the second: tidied earlier
+                title, year = cleaned or (r.name, None)
+                loose.append((r, title, year or self._title_year(r)))
+        if not loose:
+            return
+        found = self._search_titles({(ctype, t, y) for _r, t, y in loose if y}, settings, log)
+        linked, named = {}, {}
+        for pk, name, year, lang in (model.objects.filter(Q(tmdb_id__isnull=False) | Q(imdb_id__isnull=False))
+                                     .values_list("id", "name", "year", "language")):
+            linked.setdefault((self._same_title_key(name), year, lang or ""), []).append(pk)
+            named.setdefault(((name or "").strip().casefold(), lang or ""), []).append(pk)
+        for row, title, year in loose:
+            if year:
+                matches = linked.get((self._same_title_key(title), year, row.language or ""), [])
+            elif ctype == "movie":  # no year: the one movie with an ID and exactly this name
+                matches = named.get((title.strip().casefold(), row.language or ""), [])
+                done["ambiguous"] += len(matches) > 1
+            else:
+                matches = []
+            keep = model.objects.filter(pk=matches[0]).first() if len(matches) == 1 else None
+            if keep and not self._same_length(keep, row):
+                keep = None  # a different film with the same name and year
+            tmdb_id, official = found.get((ctype, title, year)) or (None, None)
+            if not keep and tmdb_id:
+                keep = model.objects.filter(tmdb_id=tmdb_id, language=row.language or "").first()
+                if keep and not self._same_length(keep, row):
+                    keep, tmdb_id = None, None
+            new_name = self._format(official or title, year, fmt)[:255]
+            keep = keep or (None if tmdb_id else model.objects.filter(
+                name=new_name, year=row.year, language=row.language, tmdb_id__isnull=True,
+                imdb_id__isnull=True).exclude(pk=row.pk).first())
+            if dry:
+                done["merged" if keep else "found" if official else "renamed"] += 1
+                if keep:
+                    gone.update(joined(row, title, keep))
+                continue
+            try:
+                with transaction.atomic():
+                    if keep:
+                        entry = joined(row, title, keep)
+                        _absorb_language_row(keep, row, rel, fk, refetch_episodes=ctype == "series")
+                        done["merged"] += 1
+                        gone.update(entry)
+                    else:
+                        cp = dict(row.custom_properties) if isinstance(row.custom_properties, dict) else {}
+                        mark = cp.get(MARK) or {}
+                        cp[MARK] = dict(mark, original_name=mark.get("original_name") or row.name,
+                                        applied_name=new_name, base_name=new_name, tag=None, imdb_id=None,
+                                        format=fmt, language=language, at=int(time.time()))
+                        change = {"tmdb_id": tmdb_id, "year": year} if tmdb_id else {}
+                        model.objects.filter(pk=row.pk).update(name=new_name, custom_properties=cp, **change)
+                        done["found" if official else "renamed"] += 1
+            except (IntegrityError, ValueError) as exc:
+                done["failed"] += 1
+                if done["failed"] <= 3:
+                    log.warning("Could not tidy %s %s: %s", ctype, row.pk, exc)
+
+    def _clear_shared_posters(self, model, gone, dry):
+        """Clears the poster of titles with no ID that share it with a differently named title
+        joined to a title with an ID just now: the provider gives neighbouring titles one poster, and
+        the join shows whose it is. Each scan adds the joined title and its poster again, so this
+        runs after every scan. Posters shared only by titles still without an ID (a collection's
+        or a show's art) stay, as do the image itself and titles with an ID."""
+        owners = {}
+        for logo_id, key in gone.values():
+            if logo_id:
+                owners.setdefault(logo_id, set()).add(key)
+        if not owners:
+            return 0
+        shared = []
+        for pk, name, logo_id in (model.objects.filter(tmdb_id__isnull=True, imdb_id__isnull=True,
+                                                       logo_id__in=list(owners))
+                                  .exclude(pk__in=list(gone)).values_list("id", "name", "logo_id")):
+            cleaned = self._strip_provider_tags(name)
+            if self._same_title_key(cleaned[0] if cleaned else name) not in owners[logo_id]:
+                shared.append(pk)
+        if shared and not dry:
+            model.objects.filter(pk__in=shared).update(logo=None)
+        return len(shared)
 
     # --- rename run -------------------------------------------------------------
 

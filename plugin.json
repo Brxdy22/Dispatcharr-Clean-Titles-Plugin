@@ -1,6 +1,6 @@
 {
   "name": "Clean Titles",
-  "version": "2.2.0.3",
+  "version": "2.2.0.4",
   "description": "Renames VOD movies and series in the catalogue to their official titles, looked up by each title's TMDB ID. Removes provider prefixes and tags like 'EN - ... (US)'. Keeps each original name so every rename can be reverted. Can also replace the providers' many categories with the streaming services you select (Netflix, Disney+, Tubi...). Dry run by default. This product uses the TMDB API but is not endorsed or certified by TMDB.",
   "author": "Brxdy22",
   "license": "MIT",

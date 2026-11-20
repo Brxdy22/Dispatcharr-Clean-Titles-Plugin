@@ -1,6 +1,6 @@
 {
   "name": "Clean Titles",
-  "version": "2.2.0.4",
+  "version": "2.3.0",
   "description": "Renames VOD movies and series in the catalogue to their official titles, looked up by each title's TMDB ID. Removes provider prefixes and tags like 'EN - ... (US)'. Keeps each original name so every rename can be reverted. Can also replace the providers' many categories with the streaming services you select (Netflix, Disney+, Tubi...). Dry run by default. This product uses the TMDB API but is not endorsed or certified by TMDB.",
   "author": "Brxdy22",
   "license": "MIT",
@@ -475,13 +475,31 @@
     {
       "id": "rename_run",
       "label": "Rename Run",
-      "description": "Starts a background run over every movie/series with a TMDB ID that hasn't been renamed yet. With Dry run on, only reports. Also runs after each M3U refresh, but only for accounts with Enable VOD Scanning on: it waits for that account's VOD scan to finish, then fixes posters and renames that account's new titles. Follow it with Status.",
+      "description": "Starts one background run in two steps: first it finds TMDB IDs for movies/series with no TMDB or IMDb ID (all accounts; searches are cached, so it picks up where it stopped), then it renames every title with a TMDB ID that hasn't been renamed yet, the newly found ones included. With Dry run on, only reports and saves no IDs. Stop Run stops both steps. Also runs after each M3U refresh, but only for accounts with Enable VOD Scanning on: it waits for that account's VOD scan to finish, finds IDs again for that account's titles (scans drop them; cached, so almost no lookups), fixes posters and renames that account's new titles. Follow it with Status.",
       "button_label": "Run",
       "button_variant": "filled",
       "button_color": "green",
       "events": [
         "m3u_refresh"
       ],
+      "async": true
+    },
+    {
+      "id": "find_ids",
+      "label": "Find TMDB IDs for no-ID titles",
+      "description": "Searches TMDB for every movie/series with no TMDB or IMDb ID (all accounts) by its cleaned name, and saves the ID when exactly one title has that name (and year, when known; a name with no year must match exactly). The name stays. Rename Run already does this as its first step; use this only to find IDs without renaming. Honors Dry run. Runs in the background, can be stopped and picks up where it stopped. Follow it with Status.",
+      "button_label": "Find IDs",
+      "button_variant": "filled",
+      "button_color": "green",
+      "async": true
+    },
+    {
+      "id": "find_ids_sample",
+      "label": "Find TMDB IDs: sample",
+      "description": "Searches 200 random titles with no ID (half movies, half series) and reports the hit rate and every match for review (id_sample.txt in the plugin's data folder). Writes nothing to the catalogue.",
+      "button_label": "Sample",
+      "button_variant": "outline",
+      "button_color": "blue",
       "async": true
     },
     {

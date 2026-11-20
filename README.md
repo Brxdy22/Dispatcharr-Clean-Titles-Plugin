@@ -17,7 +17,7 @@ Or download the `clean_titles-<version>.zip` from Releases and import it on the 
 ## Use
 
 1. Add a free [TMDB](https://www.themoviedb.org/settings/api) API key in the plugin settings.
-2. **Rename Run** starts as a dry run, so check the results before turning dry run off.
+2. **Rename Run** starts as a dry run, so check the results before turning dry run off. It first finds TMDB IDs for titles that have none, then renames, in one run. **Find TMDB IDs: sample** shows the matches for 200 such titles first, without saving anything.
 3. Original names are kept, so **Revert All Renames** puts everything back.
 4. Pick your services in **Select Streaming Services to Use + Priority**, then run **Apply Streaming Categories**. **Revert Streaming Categories** puts titles back in their provider categories.
 5. Titles only for rent or sale go to their own category, **Rent/Buy** by default.
@@ -25,7 +25,7 @@ Or download the `clean_titles-<version>.zip` from Releases and import it on the 
 
 ## Notes
 
-- Titles without a TMDB ID are left alone, because renaming them would create duplicates on the next VOD refresh.
+- Titles without a TMDB ID are never renamed by name, because that would create duplicates on the next VOD refresh. Instead Rename Run searches TMDB for them and saves the ID when exactly one title has that name (and year). Searches are cached, so later runs, and the runs after each VOD scan (which drops these IDs), need almost no lookups.
 
 ## Drag and search
 

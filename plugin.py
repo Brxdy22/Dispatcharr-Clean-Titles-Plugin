@@ -26,6 +26,7 @@ thousands of titles takes longer than a web request may wait.
 import json
 import logging
 import os
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -165,7 +166,8 @@ class Plugin:
     _BACKGROUND = {"rename_run": "Rename Run", "revert_all": "Revert All Renames", "tag_duplicates": "Tag Duplicates",
                    "unify_series": "Unify Series", "revert_unify": "Revert Unify", "fix_images": "Fix Images",
                    "group_categories": "Streaming Categories", "revert_groups": "Revert Streaming Categories",
-                   "language_preview": "Language Preview", "language_remove": "Language Filter"}
+                   "language_preview": "Language Preview", "language_remove": "Language Filter",
+                   "find_ids": "Find TMDB IDs", "find_ids_sample": "Find TMDB IDs (sample)"}
 
     def __init__(self):
         self.state = _State()
@@ -197,6 +199,10 @@ class Plugin:
                     if not settings.get("language_filter"):
                         return {"status": "error", "message": "Turn on Remove titles in other languages first, and save."}
                     return self._language_filter(settings, remove=True)
+                if action_id in ("find_ids", "find_ids_sample"):
+                    if not has_key:
+                        return {"status": "error", "message": "Set your TMDB API key in the settings first."}
+                    return self._find_ids(settings, sample=action_id == "find_ids_sample")
                 if action_id == "rename_run" and not has_key:
                     return {"status": "error", "message": "Set your TMDB API key in the settings first."}
                 if action_id == "rename_run":
@@ -532,9 +538,296 @@ class Plugin:
             model.objects.filter(pk__in=shared).update(logo=None)
         return len(shared)
 
+    # --- finding IDs for titles with no ID ----------------------------------------------
+    # Some providers send no TMDB ID at all ("EN| Title", "Title [MULTI-SUB]"). These titles are
+    # searched on TMDB by their cleaned name and, on exactly one match, get that ID saved (the name
+    # stays: the Rename Run renames them like any other title). One match only: none or several
+    # means skip, and a name with no year must also match exactly. Results, misses too, are cached
+    # in imdb_titles_data, so a run that stops picks up where it was and a rescan costs no lookups.
+    # A scan of a provider that sends no IDs adds these titles back without the ID (it matches them
+    # by name only among titles with no ID), so the IDs only last if this also runs after each scan.
+
+    ID_CACHE = "id_search.json"
+    ID_SAMPLE_REPORT = "id_sample.txt"
+    ID_CHUNK = 200          # titles per step: one DB transaction, one status update
+    ID_SAMPLE = 200
+    _BAR_PREFIX = re.compile(r"^\s*(?:4K-)?[A-Za-z0-9+]{1,8}\s*\|\s*(\S.*)$")  # "EN| Title", "NF|Title"
+    _BRACKETS = re.compile(r"\[[^\]]*\]")                                     # "[MULTI-SUB]", "[4K]"
+    _SEARCH_YEAR = re.compile(r"(?:\s+-\s*((?:19|20)\d{2})|\s*\(((?:19|20)\d{2})\)|\s*\([A-Z]{2}\))\s*$")
+
+    @classmethod
+    def _search_name(cls, name):
+        """(title, year in the name) cleaned for a TMDB search, or None. Only for searching:
+        a title with no ID is never renamed from this."""
+        text = name or ""
+        m = cls._BAR_PREFIX.match(text) or cls._PROVIDER_PREFIX.match(text)
+        if m:
+            text = m.group(1)
+        text = " ".join(cls._BRACKETS.sub(" ", text).split())
+        year = None
+        while True:
+            tail = cls._SEARCH_YEAR.search(text)
+            if not tail:
+                break
+            found = tail.group(1) or tail.group(2)
+            year = year or (int(found) if found else None)
+            text = text[:tail.start()].rstrip(" -")
+        return (text, year) if cls._same_title_key(text) else None
+
+    @staticmethod
+    def _safe_error(exc):
+        """An error's type and HTTP status only: request errors carry the URL, with the API key."""
+        code = getattr(getattr(exc, "response", None), "status_code", None)
+        return type(exc).__name__ + (f" (HTTP {code})" if code else "")
+
+    @staticmethod
+    def _tmdb_search_page(session, key, kind, title, year, language, limiter, page=1):
+        """(results, total pages) of one TMDB search page; no year means any year."""
+        params = {"query": title, "language": language, "include_adult": "false", "page": page}
+        if year:
+            params["primary_release_year" if kind == "movie" else "first_air_date_year"] = year
+        headers = {"Accept": "application/json"}
+        if key.startswith("eyJ"):
+            headers["Authorization"] = f"Bearer {key}"
+        else:
+            params["api_key"] = key
+        for attempt in range(4):
+            limiter.wait()
+            r = session.get(f"{TMDB}/search/{'movie' if kind == 'movie' else 'tv'}", params=params, headers=headers, timeout=15)
+            if r.status_code == 429:
+                time.sleep(float(r.headers.get("Retry-After", 2)) + attempt)
+                continue
+            if r.status_code == 401:
+                raise PermissionError("TMDB rejected the API key (401).")
+            r.raise_for_status()
+            d = r.json()
+            return d.get("results") or [], int(d.get("total_pages") or 1)
+        raise RuntimeError("TMDB kept rate-limiting (429).")
+
+    @classmethod
+    def _find_id(cls, session, key, ctype, title, year, language, limiter):
+        """[TMDB id, TMDB title, year, poster path] when exactly one title of this type has this
+        exact name (in this year, when known), else None. With no year a second page is read
+        before trusting a single match, so a same-named title further down isn't missed."""
+        results, pages = cls._tmdb_search_page(session, key, ctype, title, year, language, limiter)
+        hits = cls._exact_hits(results, title)
+        if len(hits) == 1 and not year and pages > 1:
+            more, _ = cls._tmdb_search_page(session, key, ctype, title, year, language, limiter, page=2)
+            seen = {x.get("id") for x in results}
+            hits = cls._exact_hits(results + [x for x in more if x.get("id") not in seen], title)
+        if len(hits) != 1 or not hits[0].get("id"):
+            return None
+        hit = hits[0]
+        date = hit.get("release_date") or hit.get("first_air_date") or ""
+        return [str(hit["id"]), hit.get("title") or hit.get("name") or "",
+                int(date[:4]) if date[:4].isdigit() else None, hit.get("poster_path")]
+
+    def _id_cache(self, cache=None):
+        """Reads the search cache, or with cache writes it: {key: [match or None, time]}."""
+        path = os.path.join(self.state.dir, self.ID_CACHE)
+        if cache is None:
+            try:
+                with open(path, encoding="utf-8") as f:
+                    return json.load(f)
+            except (OSError, ValueError):
+                return {}
+        with open(path + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(cache, f, separators=(",", ":"))
+        os.replace(path + ".tmp", path)
+        return cache
+
+    def _id_key(self, ctype, title, year):
+        return f"{ctype}:{self._same_title_key(title)}:{year or ''}"
+
+    def _id_fresh(self, entry, now):
+        """A cached match is kept; a miss is searched again after about a month."""
+        return bool(entry) and (entry[0] is not None or now - entry[1] < self.PLATFORM_TTL)
+
+    def _id_candidates(self, scope, account=None, sample=0):
+        """[(type, pk, search title, year, language, poster url, name)] for titles with no TMDB or
+        IMDb ID (of one account, when given). sample: that many at random, half movies, half series."""
+        from django.db.models import Q
+        from apps.vod import models as vm
+
+        out = []
+        for ctype, model, rel, fk in (("movie", vm.Movie, vm.M3UMovieRelation, "movie"),
+                                      ("series", vm.Series, vm.M3USeriesRelation, "series")):
+            if scope not in ("both", "movies" if ctype == "movie" else "series"):
+                continue
+            qs = model.objects.filter(Q(tmdb_id__isnull=True) | Q(tmdb_id=""), Q(imdb_id__isnull=True) | Q(imdb_id=""))
+            if account is not None:
+                qs = qs.filter(id__in=rel.objects.filter(m3u_account_id=account.id).values(f"{fk}_id"))
+            if sample:
+                qs = qs.order_by("?")[:sample // 2 if scope == "both" else sample]
+            for pk, name, year, lang, cp, logo in qs.values_list("id", "name", "year", "language", "custom_properties",
+                                                                  "logo__url").iterator(chunk_size=2000):
+                cleaned = self._search_name(name)
+                if not cleaned:
+                    continue
+                if not year:
+                    date = str((cp or {}).get("releaseDate") or (cp or {}).get("release_date") or "") if isinstance(cp, dict) else ""
+                    year = int(date[:4]) if date[:4].isdigit() else None
+                out.append((ctype, pk, cleaned[0], cleaned[1] or year, lang or "", logo or "", name))
+        return out
+
+    def _save_found_id(self, ctype, pk, tmdb_id, st):
+        """Saves a found ID on one title with no ID, or joins it to the title that already has that
+        ID (Dispatcharr allows one title per ID and language). Its name is left as it is."""
+        from apps.vod import models as vm
+        from apps.vod.tasks import _absorb_language_row
+
+        model, rel, fk = ((vm.Movie, vm.M3UMovieRelation, "movie") if ctype == "movie"
+                          else (vm.Series, vm.M3USeriesRelation, "series"))
+        row = model.objects.filter(pk=pk).first()
+        if row is None or row.tmdb_id or row.imdb_id:
+            return  # changed since the run started
+        lang = row.language or ""
+        keep = model.objects.filter(tmdb_id=tmdb_id, language=lang).exclude(pk=pk).first()
+        if keep is not None:
+            if not self._same_length(keep, row):
+                st["skipped"] += 1  # runtimes far apart: a different film of the same name
+                return
+            _absorb_language_row(keep, row, rel, fk, refetch_episodes=ctype == "series")
+            st["joined"] += 1
+            return
+        cp = dict(row.custom_properties) if isinstance(row.custom_properties, dict) else {}
+        mark = cp.get(MARK) or {}
+        cp[MARK] = dict(mark, original_name=mark.get("original_name") or row.name, found_id=str(tmdb_id),
+                        found_at=int(time.time()))
+        model.objects.filter(pk=pk).update(tmdb_id=str(tmdb_id), custom_properties=cp)
+        st["saved"] += 1
+
+    def _find_ids(self, settings, account=None, sample=False, notify=True, chained=False):
+        """Searches TMDB for titles with no ID and saves the ID on exactly one match. sample: a
+        dry look at ID_SAMPLE random titles that writes nothing (not even the cache) and lists
+        every match for review in id_sample.txt. Honors Dry run otherwise. chained: step 1 of a
+        Rename Run, which keeps the run marked running and the stop flag set for step 2."""
+        import requests
+        from django.db import IntegrityError, transaction
+
+        log = logging.getLogger(LOGGER_NAME)
+        key = (settings.get("tmdb_api_key") or "").strip()
+        if not key:
+            return {"status": "error", "message": "Set your TMDB API key in the settings first."}
+        dry = sample or bool(settings.get("dry_run", True))
+        language = (settings.get("language") or "en-US").strip()
+        st = {"running": True, "action": "find_ids", "sample": sample, "dry_run": dry, "started": time.time(),
+              "total": 0, "processed": 0, "searched": 0, "found": 0, "no_match": 0, "saved": 0, "joined": 0,
+              "skipped": 0, "failed": 0, "errors": 0, "stopped": False, "samples": [], "message": ""}
+        if account is not None:
+            st["account"] = account.name
+        if chained:
+            st["phase"] = 1
+        self.state.flag(self.state.stop_path, False)
+        self.state.write(st)
+        cache = {} if sample else self._id_cache()
+        report, fatal = [], None
+        try:
+            cands = self._id_candidates(settings.get("scope") or "both", account, self.ID_SAMPLE if sample else 0)
+            _release_db_connections()
+            by_key = {}
+            for c in cands:
+                by_key.setdefault(self._id_key(c[0], c[2], c[3]), []).append(c)
+            st["total"] = len(cands)
+            keys = list(by_key)
+            limiter = _RateLimiter(settings.get("requests_per_second") or 20)
+            session = requests.Session()
+            log.info("Find IDs started: %d titles with no ID (%d names)%s%s", len(cands), len(keys),
+                     f", account={account.name}" if account is not None else "", ", sample" if sample else "")
+            for i in range(0, len(keys), self.ID_CHUNK):
+                chunk = keys[i:i + self.ID_CHUNK]
+                now = time.time()
+                todo = [k for k in chunk if not self._id_fresh(cache.get(k), now)]
+                if todo:
+                    with ThreadPoolExecutor(max_workers=4) as pool:
+                        futures = {pool.submit(self._find_id, session, key, by_key[k][0][0], by_key[k][0][2],
+                                               by_key[k][0][3], language, limiter): k for k in todo}
+                        for fut in as_completed(futures):
+                            try:
+                                cache[futures[fut]] = [fut.result(), time.time()]
+                                st["searched"] += 1
+                            except PermissionError as exc:
+                                fatal = str(exc)
+                            except Exception as exc:  # noqa: BLE001 - searched again next run
+                                st["errors"] += 1
+                                if st["errors"] <= 5:
+                                    log.warning("Title search failed: %s", self._safe_error(exc))
+                            if fatal or self.state.has(self.state.stop_path):
+                                for f in futures:
+                                    f.cancel()
+                                break
+                if fatal or self.state.has(self.state.stop_path):
+                    st["stopped"] = True
+                    break
+                hits = []
+                for k in chunk:
+                    match = (cache.get(k) or [None])[0]
+                    for c in by_key[k]:
+                        st["processed"] += 1
+                        if k not in cache:
+                            continue  # the search failed: tried again next run
+                        if match is None:
+                            st["no_match"] += 1
+                            continue
+                        st["found"] += 1
+                        hits.append((c, match))
+                for c, match in hits:
+                    poster = match[3] and c[5] and c[5].rsplit("/", 1)[-1] == match[3].rsplit("/", 1)[-1]
+                    line = (f"{c[6]}  ->  {match[1]} ({match[2] or '?'}) tmdb {match[0]}"
+                            f"{'' if c[3] else ' [no year]'}{' [same poster]' if poster else ''}")
+                    if sample:
+                        report.append(f"{c[0]}\t{line}")
+                    elif len(st["samples"]) < 15:
+                        st["samples"].append(line)
+                if not dry and hits:
+                    with transaction.atomic():
+                        for c, match in hits:
+                            try:
+                                with transaction.atomic():
+                                    self._save_found_id(c[0], c[1], match[0], st)
+                            except (IntegrityError, ValueError) as exc:
+                                st["failed"] += 1
+                                if st["failed"] <= 3:
+                                    log.warning("Could not save the ID of %s %s: %s", c[0], c[1], type(exc).__name__)
+                    _release_db_connections()
+                self.state.write(st)
+                if not sample and (i // self.ID_CHUNK) % 10 == 9:
+                    self._id_cache(cache)
+                time.sleep(0.05)  # leaves room for Dispatcharr between steps
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Find IDs failed: %s", self._safe_error(exc))
+            st["failed_run"] = self._safe_error(exc)
+        finally:
+            if not sample:
+                self._id_cache(cache)
+            _release_db_connections()
+        if sample:
+            path = os.path.join(self.state.dir, self.ID_SAMPLE_REPORT)
+            with open(path + ".tmp", "w", encoding="utf-8") as f:
+                f.writelines(f"{x}\n" for x in sorted(report))
+            os.replace(path + ".tmp", path)
+            st["report"] = path
+            st["samples"] = [x.split("\t", 1)[1] for x in report[:30]]
+            st["by_type"] = {t: [sum(1 for c in cands if c[0] == t), sum(1 for x in report if x.startswith(t + "\t"))]
+                             for t in ("movie", "series")}
+        st["running"] = chained and not (fatal or st["stopped"])  # a Rename Run carries on with step 2
+        st["finished"] = time.time()
+        st["message"] = fatal or ""
+        self.state.write(st)
+        if not chained:
+            self.state.flag(self.state.stop_path, False)
+        summary = self._describe(dict(st, running=False))  # this step is done, even when step 2 follows
+        log.info("Find IDs finished: %s", summary.replace("\n", " | "))
+        if (notify or fatal) and not chained:
+            self._notify(summary, bool(fatal or st["stopped"]), title="Clean Titles: find TMDB IDs")
+        return {"status": "error" if fatal else "ok", "message": summary, "stopped": st["stopped"],
+                "total": st["total"]}
+
     # --- rename run -------------------------------------------------------------
 
-    def _rename_run(self, settings, account=None):
+    def _rename_run(self, settings, account=None, find=True):
+        """find: first finds TMDB IDs for the titles with no ID (step 1), so they are renamed in
+        the same run (step 2). One status, one stop flag for both steps."""
         import logging
 
         import requests
@@ -552,6 +845,18 @@ class Plugin:
         language = (settings.get("language") or "en-US").strip()
         limiter = _RateLimiter(settings.get("requests_per_second") or 20)
         recheck = self.state.has(self.state.recheck_path)
+
+        found_ids = None
+        if find:
+            found_ids = self._find_ids(settings, account=account, notify=False, chained=True)
+            if found_ids["status"] == "error" or found_ids.get("stopped"):
+                st = dict(self.state.read(), running=False)  # stopped or failed: no step 2
+                self.state.write(st)
+                self.state.flag(self.state.stop_path, False)
+                summary = f"{found_ids['message']}\nRename Run stopped before renaming."
+                log.info("Rename run finished: %s", summary.replace("\n", " | "))
+                self._notify(summary, True)
+                return {"status": found_ids["status"], "message": summary}
 
         kinds = [k for k in ("movie", "series") if scope in ("both", "movies" if k == "movie" else "series")]
         models = {"movie": Movie, "series": Series}
@@ -572,7 +877,12 @@ class Plugin:
             "processed": 0, "renamed": 0, "unchanged": 0, "not_found": 0, "conflicts": 0, "errors": 0,
             "samples": [], "stopped": False, "message": "",
         }
-        self.state.flag(self.state.stop_path, False)
+        if found_ids is not None:
+            st["phase"] = 2
+            st["find_summary"] = (found_ids["message"] if found_ids.get("total")
+                                  else "Find TMDB IDs: every title has an ID.")
+        else:
+            self.state.flag(self.state.stop_path, False)  # step 1 cleared it; a stop since is kept
         self.state.write(st)
         if account is not None:
             st["account"] = account.name
@@ -891,14 +1201,23 @@ class Plugin:
                 self._pending(add=account.id)  # stopped (e.g. plugin reloaded): do it next time
                 messages.append(f"{account.name}: stopped while waiting for its VOD scan; queued for the next refresh.")
                 break
+            has_key = bool((settings.get("tmdb_api_key") or "").strip())
+            found_ids = None
+            if has_key:
+                # first: the scan put these titles back without their IDs (cached matches: no
+                # lookups), so sorting, the language filter and renaming see them
+                found_ids = self._find_ids(settings, account=account, notify=False)
+                messages.append(found_ids["message"])
             if settings.get("tidy_no_id"):  # before sorting, so joined titles sort by their ID
                 messages.append(self._tidy_no_id(settings))
             messages.append(self._group_categories(settings, notify=False)["message"])
             if settings.get("language_filter"):  # before renaming, so removed titles aren't renamed first
                 messages.append(self._language_filter(settings, remove=True, notify=False)["message"])
             messages.append(self._fix_images(settings, notify=False, account=account)["message"])
-            if (settings.get("tmdb_api_key") or "").strip():
-                messages.append(self._rename_run(settings, account=account)["message"])
+            if has_key and found_ids.get("stopped"):
+                messages.append(f"{account.name}: stopped while finding TMDB IDs; not renamed.")
+            elif has_key:  # the IDs were found above, before the other steps
+                messages.append(self._rename_run(settings, account=account, find=False)["message"])
             nxt = self._pending(take=True)
             account = None
             if nxt:
@@ -2304,11 +2623,41 @@ class Plugin:
             return (f"Revert unify {state}: {st.get('reverted', 0)}/{st.get('total', 0)} shows split back,"
                     f" {st.get('restored', 0)} copies restored as their own show,"
                     f" {st.get('gone', 0)} not restored (the provider no longer lists them), {st.get('failed', 0)} failed.")
+        if st.get("action") == "find_ids":
+            dry = st.get("dry_run")
+            head = "Find TMDB IDs sample (writes nothing)" if st.get("sample") else f"Find TMDB IDs {'dry run ' if dry else ''}"
+            if st.get("phase"):
+                head = f"Rename Run step 1 of 2: {head}"
+            lines = [f"{head} {state}{' for ' + st['account'] if st.get('account') else ''}:"
+                     f" {st.get('processed', 0)}/{st.get('total', 0)} titles with no ID, {st.get('searched', 0)} searched on TMDB."]
+            done = st.get("found", 0) + st.get("no_match", 0)
+            rate = f" ({st.get('found', 0) * 100 // done}%)" if done else ""
+            lines.append(f"{st.get('found', 0)} matched exactly once{rate}, {st.get('no_match', 0)} with no single match"
+                         f"{', ' + str(st['errors']) + ' searches failed (tried again next run)' if st.get('errors') else ''}.")
+            for t, (n, hit) in (st.get("by_type") or {}).items():
+                lines.append(f"{'Movies' if t == 'movie' else 'Series'}: {hit} of {n} matched.")
+            if not dry:
+                lines.append(f"{st.get('saved', 0)} IDs saved, {st.get('joined', 0)} joined to the title with that ID,"
+                             f" {st.get('skipped', 0)} skipped (runtime differs), {st.get('failed', 0)} failed."
+                             + (" Renamed next, in step 2." if st.get("phase") else " Rename Run renames them."))
+            elif st.get("phase") and st.get("found"):
+                lines.append("Dry run: these IDs are not saved, so step 2 cannot rename those titles yet.")
+            for k in ("message", "failed_run"):
+                if st.get(k):
+                    lines.append(st[k])
+            if st.get("samples"):
+                lines.append("Examples:")
+                lines.extend(f"  {s}" for s in st["samples"])
+            if st.get("report"):
+                lines.append(f"Full list: {st['report']}")
+            return "\n".join(lines).replace("  ", " ").replace("\n ", "\n  ")
         if st.get("action") == "revert_all":
             return (f"Revert {state}: {st.get('reverted', 0)} restored, {st.get('conflicts', 0)} skipped "
                     f"(name already taken), {st.get('processed', 0)}/{st.get('total', 0)} processed.")
         verb = "would rename" if st.get("dry_run") else "renamed"
-        lines = [
+        lines = [st["find_summary"]] if st.get("find_summary") else []
+        lines += [
+            f"{'Step 2 of 2: ' if st.get('phase') else ''}"
             f"{'Dry run' if st.get('dry_run') else 'Rename run'} {state}: {st.get('processed', 0)}/{st.get('total', 0)} looked up. "
             f"{st.get('renamed', 0)} {verb}, {st.get('unchanged', 0)} already correct, "
             f"{st.get('not_found', 0)} not on TMDB, {st.get('conflicts', 0)} skipped (name already taken), "

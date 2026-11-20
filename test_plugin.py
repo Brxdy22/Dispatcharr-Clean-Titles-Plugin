@@ -422,5 +422,276 @@ class PageScript(unittest.TestCase):
             self.assertIn(label, handle.read())
 
 
+def temp_state(folder):
+    state = p._State.__new__(p._State)
+    state.dir = folder
+    state.status_path = os.path.join(folder, "status.json")
+    state.stop_path = os.path.join(folder, "stop")
+    state.recheck_path = os.path.join(folder, "recheck")
+    return state
+
+
+def fake_django():
+    db = mock.MagicMock()
+    db.IntegrityError = type("IntegrityError", (Exception,), {})
+    db.connection.in_atomic_block = True  # _release_db_connections leaves it alone
+    return {"django.db": db, "django": mock.MagicMock(db=db)}
+
+
+class FindIds(unittest.TestCase):
+    def test_search_name_takes_off_prefix_tags_and_year(self):
+        name = p.Plugin._search_name
+        self.assertEqual(name("EN| Movie Title"), ("Movie Title", None))
+        self.assertEqual(name("Second Movie: Subtitle [MULTI-SUB]"), ("Second Movie: Subtitle", None))
+        self.assertEqual(name("EN| Third Movie: A Long Journey - 2020"), ("Third Movie: A Long Journey", 2020))
+        self.assertEqual(name("EN| Fourth Movie - 2025 [4K]"), ("Fourth Movie", 2025))
+        self.assertEqual(name("Fifth Movie  [MULTI-SUB]"), ("Fifth Movie", None))
+        self.assertEqual(name("EN - Show Title (2021) (US)"), ("Show Title", 2021))
+        self.assertEqual(name("NF|Title"), ("Title", None))
+
+    def test_search_name_keeps_titles_that_are_numbers_or_dashes(self):
+        name = p.Plugin._search_name
+        self.assertEqual(name("EN| 2075"), ("2075", None))
+        self.assertEqual(name("Hero-Man: Way Home"), ("Hero-Man: Way Home", None))
+        self.assertEqual(name("Boxer - Part Two"), ("Boxer - Part Two", None))
+        self.assertIsNone(name("[MULTI-SUB]"))
+
+    def find(self, pages, year):
+        with mock.patch.object(p.Plugin, "_tmdb_search_page", side_effect=pages) as search:
+            return p.Plugin._find_id(None, "k", "movie", "Movie Title", year, "en-US", None), search
+
+    def test_one_exact_match_gives_the_id(self):
+        page = ([{"id": 5, "title": "Movie Title", "release_date": "2020-01-02", "poster_path": "/a.jpg"},
+                 {"id": 6, "title": "Movie Title 2"}], 1)
+        found, _ = self.find([page], 2020)
+        self.assertEqual(found, ["5", "Movie Title", 2020, "/a.jpg"])
+
+    def test_none_or_several_matches_are_skipped(self):
+        self.assertIsNone(self.find([([{"id": 6, "title": "Movie Title 2"}], 1)], 2020)[0])
+        self.assertIsNone(self.find([([], 0)], 2020)[0])
+        two = ([{"id": 5, "title": "Movie Title"}, {"id": 7, "original_title": "Movie Title"}], 1)
+        self.assertIsNone(self.find([two], None)[0])
+
+    def test_no_year_reads_a_second_page_before_trusting_one_match(self):
+        first = ([{"id": 5, "title": "Movie Title"}] + [{"id": 100 + i, "title": f"Other {i}"} for i in range(19)], 3)
+        second = ([{"id": 9, "title": "Movie: Title"}], 3)
+        found, search = self.find([first, second], None)
+        self.assertIsNone(found)
+        self.assertEqual(search.call_args_list[1].kwargs.get("page"), 2)
+        found, search = self.find([first, ([], 3)], None)
+        self.assertEqual(found[0], "5")
+        found, search = self.find([first], 2020)  # with a year one page is enough
+        self.assertEqual(search.call_count, 1)
+
+    def test_misses_are_searched_again_after_a_month_matches_never(self):
+        plugin, now = p.Plugin(), time.time()
+        self.assertTrue(plugin._id_fresh([["1", "T", 2020, None], now - 365 * 86400], now))
+        self.assertTrue(plugin._id_fresh([None, now - 86400], now))
+        self.assertFalse(plugin._id_fresh([None, now - 31 * 86400], now))
+        self.assertFalse(plugin._id_fresh(None, now))
+
+    def test_errors_never_show_the_key(self):
+        exc = Exception("401 for url https://api.themoviedb.org/3/search/movie?api_key=SECRETKEY")
+        exc.response = mock.Mock(status_code=500)
+        self.assertNotIn("SECRETKEY", p.Plugin._safe_error(exc))
+        self.assertIn("500", p.Plugin._safe_error(exc))
+
+    def run_find(self, folder, cands, answers, sample=False, dry=False, stop_after=None):
+        plugin = p.Plugin()
+        plugin.state = temp_state(folder)
+        calls = []
+
+        def find_id(_session, _key, ctype, title, year, _lang, _lim):
+            calls.append((ctype, title, year))
+            if stop_after and len(calls) >= stop_after:
+                plugin.state.flag(plugin.state.stop_path, True)
+            return answers.get(title)
+
+        saved = []
+        settings = {"tmdb_api_key": "k", "dry_run": dry, "requests_per_second": 1000}
+        with mock.patch.dict("sys.modules", fake_django()), \
+                mock.patch.object(plugin, "_id_candidates", return_value=cands), \
+                mock.patch.object(p.Plugin, "_find_id", side_effect=find_id), \
+                mock.patch.object(plugin, "_save_found_id", side_effect=lambda c, pk, t, st: saved.append((pk, t))), \
+                mock.patch.object(p.time, "sleep"):
+            result = plugin._find_ids(settings, sample=sample, notify=False)
+        return result, calls, saved, plugin
+
+    CANDS = [("movie", 1, "Movie Title", None, "", "", "EN| Movie Title"),
+             ("movie", 2, "Movie Title", None, "", "", "Movie Title [MULTI-SUB]"),
+             ("series", 3, "Series Title", 2020, "", "", "EN| Series Title")]
+
+    def test_a_run_saves_matches_and_caches_misses(self):
+        with tempfile.TemporaryDirectory() as folder:
+            answers = {"Movie Title": ["5", "Movie Title", 2020, None]}
+            result, calls, saved, plugin = self.run_find(folder, self.CANDS, answers)
+            self.assertEqual(len(calls), 2)  # one search per name, not per title
+            self.assertEqual(sorted(saved), [(1, "5"), (2, "5")])
+            st = plugin.state.read()
+            self.assertEqual((st["found"], st["no_match"], st["running"]), (2, 1, False))
+            with open(os.path.join(folder, p.Plugin.ID_CACHE), encoding="utf-8") as f:
+                self.assertEqual(len(json.load(f)), 2)
+            _r, calls, saved, _p = self.run_find(folder, self.CANDS, answers)
+            self.assertEqual(calls, [])  # all from the cache, the miss included
+            self.assertEqual(len(saved), 2)
+
+    def test_dry_run_saves_nothing(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _r, calls, saved, _p = self.run_find(folder, self.CANDS, {"Series Title": ["9", "Series Title", 2020, None]}, dry=True)
+            self.assertEqual(saved, [])
+            self.assertEqual(len(calls), 2)
+
+    def test_sample_writes_nothing_but_its_report(self):
+        with tempfile.TemporaryDirectory() as folder:
+            answers = {"Movie Title": ["5", "Movie Title", 2020, None]}
+            result, _calls, saved, plugin = self.run_find(folder, self.CANDS, answers, sample=True)
+            self.assertEqual(saved, [])
+            self.assertFalse(os.path.exists(os.path.join(folder, p.Plugin.ID_CACHE)))
+            with open(os.path.join(folder, p.Plugin.ID_SAMPLE_REPORT), encoding="utf-8") as f:
+                self.assertEqual(len(f.read().splitlines()), 2)
+            self.assertIn("2 matched exactly once (66%)", result["message"])
+
+    def test_stop_keeps_what_was_searched_for_next_time(self):
+        with tempfile.TemporaryDirectory() as folder:
+            many = [("movie", i, f"Title {i}", 2000, "", "", f"EN| Title {i}") for i in range(500)]
+            _r, calls, saved, plugin = self.run_find(folder, many, {}, stop_after=50)
+            self.assertTrue(plugin.state.read()["stopped"])
+            self.assertLess(len(calls), 500)
+            with open(os.path.join(folder, p.Plugin.ID_CACHE), encoding="utf-8") as f:
+                cached = len(json.load(f))
+            self.assertGreaterEqual(cached, 1)
+            self.assertFalse(os.path.exists(plugin.state.stop_path))
+            _r, calls, _s, _p = self.run_find(folder, many, {})
+            self.assertEqual(len(calls), 500 - cached)
+
+    def refresh(self, settings, stopped=False):
+        plugin = p.Plugin()
+        plugin.state = mock.Mock()
+        plugin.state.busy.return_value = False
+        order = []
+        account = mock.Mock(id=33)
+        account.name = "Provider"
+
+        def step(n):
+            def call(*a, **k):
+                order.append((n, k.get("find")) if n == "_rename_run" else n)
+                if n == "_tidy_no_id":
+                    return n
+                return {"message": n, "stopped": stopped} if n == "_find_ids" else {"message": n}
+            return call
+        for name in ("_tidy_no_id", "_find_ids", "_group_categories", "_fix_images", "_rename_run"):
+            setattr(plugin, name, step(name))
+        with mock.patch.object(plugin, "_event_account", return_value=account), \
+                mock.patch.object(plugin, "_vod_enabled", return_value=True), \
+                mock.patch.object(plugin, "_wait_for_vod_scan", return_value=True), \
+                mock.patch.object(plugin, "_pending", return_value=[]):
+            result = plugin._on_m3u_refresh(settings, {})
+        return order, result
+
+    def test_after_a_scan_ids_are_always_found_first_and_renamed_last(self):
+        order, _r = self.refresh({"tmdb_api_key": "k", "tidy_no_id": True})
+        self.assertEqual(order[:2], ["_find_ids", "_tidy_no_id"])
+        self.assertEqual(order[-1], ("_rename_run", False))  # IDs already found: not searched twice
+        order, _r = self.refresh({"tidy_no_id": True})  # no key: no TMDB at all
+        self.assertNotIn("_find_ids", order)
+        self.assertNotIn(("_rename_run", False), order)
+
+    def test_a_stop_while_finding_after_a_scan_skips_the_rename(self):
+        order, result = self.refresh({"tmdb_api_key": "k"}, stopped=True)
+        self.assertNotIn(("_rename_run", False), order)
+        self.assertIn("not renamed", result["message"])
+
+    def run_rename(self, folder, find_result, dry=False, rows=()):
+        """Rename Run with step 1 faked; rows: (pk, tmdb_id, custom_properties) of titles with an ID."""
+        plugin = p.Plugin()
+        plugin.state = temp_state(folder)
+        calls = []
+
+        def find_ids(settings, account=None, sample=False, notify=True, chained=False):
+            calls.append(("find", chained, notify, bool(settings.get("dry_run"))))
+            plugin.state.write({"running": chained and not find_result.get("stopped"), "action": "find_ids",
+                                "phase": 1, "stopped": bool(find_result.get("stopped"))})
+            return find_result
+
+        model = mock.MagicMock()
+        model.objects.exclude.return_value.values_list.return_value.iterator.return_value = list(rows)
+        vod = mock.MagicMock(Movie=model, Series=model)
+        modules = dict(fake_django(), **{"django.db.models": mock.MagicMock(), "apps": mock.MagicMock(),
+                                         "apps.vod": mock.MagicMock(models=vod), "apps.vod.models": vod})
+        with mock.patch.dict("sys.modules", modules), \
+                mock.patch.object(plugin, "_find_ids", side_effect=find_ids), \
+                mock.patch.object(p.Plugin, "_lookup", side_effect=lambda *a: calls.append(("lookup", a[3])) or None), \
+                mock.patch.object(plugin, "_name_without_prefix", return_value=None), \
+                mock.patch.object(plugin, "_tag_duplicates", return_value=None), \
+                mock.patch.object(plugin, "_notify") as notify:
+            result = plugin._rename_run({"tmdb_api_key": "k", "dry_run": dry, "scope": "movies",
+                                         "requests_per_second": 1000})
+        return result, calls, plugin, notify
+
+    def test_rename_run_finds_ids_first_in_the_same_run(self):
+        with tempfile.TemporaryDirectory() as folder:
+            found = {"status": "ok", "message": "Rename Run step 1 of 2: found", "stopped": False, "total": 3}
+            result, calls, plugin, notify = self.run_rename(folder, found, rows=[(1, "5", {})])
+            self.assertEqual(calls[0], ("find", True, False, False))  # chained, silent: one notice at the end
+            self.assertEqual(calls[1:], [("lookup", "5")])  # then the rename
+            st = plugin.state.read()
+            self.assertEqual((st["action"], st["phase"], st["running"]), ("rename_run", 2, False))
+            self.assertTrue(result["message"].startswith("Rename Run step 1 of 2: found\nStep 2 of 2: Rename run finished"))
+            self.assertEqual(notify.call_count, 1)
+            self.assertFalse(os.path.exists(plugin.state.stop_path))
+
+    def test_rename_run_passes_dry_run_to_the_find_step(self):
+        with tempfile.TemporaryDirectory() as folder:
+            found = {"status": "ok", "message": "m", "stopped": False, "total": 0}
+            result, calls, _p, _n = self.run_rename(folder, found, dry=True)
+            self.assertEqual(calls[0], ("find", True, False, True))
+            self.assertIn("every title has an ID", result["message"])
+
+    def test_a_stop_while_finding_stops_the_rename_too(self):
+        with tempfile.TemporaryDirectory() as folder:
+            stopped = {"status": "ok", "message": "Rename Run step 1 of 2: stopped", "stopped": True, "total": 9}
+            result, calls, plugin, notify = self.run_rename(folder, stopped, rows=[(1, "5", {})])
+            self.assertEqual([c[0] for c in calls], ["find"])  # no lookups for renaming
+            self.assertFalse(plugin.state.read()["running"])
+            self.assertIn("stopped before renaming", result["message"])
+            self.assertEqual(notify.call_count, 1)
+
+    def test_a_stop_set_after_finding_is_kept_for_the_rename(self):
+        with tempfile.TemporaryDirectory() as folder:
+            state = temp_state(folder)
+            state.flag(state.stop_path, True)  # pressed between the steps
+            found = {"status": "ok", "message": "m", "stopped": False, "total": 1}
+            _r, calls, plugin, _n = self.run_rename(folder, found, rows=[(1, "5", {}), (2, "6", {})])
+            self.assertTrue(plugin.state.read()["stopped"])
+            self.assertFalse(os.path.exists(plugin.state.stop_path))
+
+    def test_chained_find_keeps_the_run_going_and_the_stop_flag(self):
+        with tempfile.TemporaryDirectory() as folder:
+            plugin = p.Plugin()
+            plugin.state = temp_state(folder)
+            settings = {"tmdb_api_key": "k", "dry_run": False, "requests_per_second": 1000}
+            with mock.patch.dict("sys.modules", fake_django()), \
+                    mock.patch.object(plugin, "_id_candidates", return_value=self.CANDS), \
+                    mock.patch.object(p.Plugin, "_find_id", return_value=None), \
+                    mock.patch.object(plugin, "_notify") as notify, \
+                    mock.patch.object(p.time, "sleep"):
+                result = plugin._find_ids(settings, chained=True)
+            st = plugin.state.read()
+            self.assertTrue(st["running"])  # step 2 follows: no gap for another run to start in
+            self.assertEqual(st["phase"], 1)
+            self.assertIn("step 1 of 2", result["message"])
+            self.assertIn("finished", result["message"])
+            self.assertEqual((result["stopped"], result["total"]), (False, 3))
+            notify.assert_not_called()
+
+    def test_after_scan_setting_is_gone_and_actions_run_in_the_background(self):
+        self.assertNotIn("find_ids_after_scan", {f["id"] for f in p._MANIFEST["fields"]})
+        actions = {a["id"]: a for a in p._MANIFEST["actions"]}
+        self.assertTrue(actions["find_ids"]["async"] and actions["find_ids_sample"]["async"])
+        self.assertTrue(actions["rename_run"]["async"])
+        self.assertIn("finds TMDB IDs", actions["rename_run"]["description"])
+        self.assertEqual(p.MARK, "imdb_titles")
+
+
 if __name__ == "__main__":
     unittest.main()

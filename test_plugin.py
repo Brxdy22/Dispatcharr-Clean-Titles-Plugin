@@ -4,6 +4,7 @@ import os
 import tempfile
 import threading
 import time
+import types
 import unittest
 from unittest import mock
 
@@ -762,6 +763,44 @@ class StableIds(unittest.TestCase):
             p._patch_vod_scan()  # a plugin reload
         for name, original in originals.items():
             self.assertIs(getattr(tasks, name).clean_titles_original, original)
+
+    def loader(self, before=1.0, after=1.0):
+        manager = mock.Mock(_last_reload_token=before)
+        manager.discover_plugins.side_effect = lambda **k: setattr(manager, "_last_reload_token", after)
+        loader = mock.Mock()
+        loader.PluginManager.get.return_value = manager
+        plugins = mock.Mock(loader=loader)
+        modules = {"apps": mock.Mock(plugins=plugins), "apps.plugins": plugins, "apps.plugins.loader": loader}
+        return manager, mock.patch.dict("sys.modules", modules)
+
+    def test_a_vod_scan_loads_the_newest_plugin_code_first(self):
+        manager, modules = self.loader(before=1.0, after=2.0)
+        with modules, self.assertLogs(p.LOGGER_NAME, "INFO") as logs:
+            p._fresh_plugins_before_scan(task=types.SimpleNamespace(name=p.SCAN_TASK))
+        manager.discover_plugins.assert_called_once_with(sync_db=False, use_cache=True, release_connections=False)
+        self.assertIn("newest plugin code", logs.output[0])
+
+    def test_other_tasks_never_reload_plugins(self):
+        manager, modules = self.loader()
+        with modules:
+            p._fresh_plugins_before_scan(task=types.SimpleNamespace(name="apps.m3u.tasks.refresh_single_m3u_account"))
+            p._fresh_plugins_before_scan(sender=None, task=None)
+        manager.discover_plugins.assert_not_called()
+
+    def test_a_failing_reload_check_still_lets_the_scan_run(self):
+        manager, modules = self.loader()
+        manager.discover_plugins.side_effect = RuntimeError("boom")
+        with modules, self.assertLogs(p.LOGGER_NAME, "ERROR"):
+            p._fresh_plugins_before_scan(task=types.SimpleNamespace(name=p.SCAN_TASK))
+
+    def test_the_scan_hook_is_connected_once_per_process(self):
+        signals = mock.Mock()
+        celery = mock.Mock(signals=signals)
+        with mock.patch.dict("sys.modules", {"celery": celery, "celery.signals": signals}):
+            p._hook_vod_scan()
+            p._hook_vod_scan()  # a plugin reload
+        for call in signals.task_prerun.connect.call_args_list:
+            self.assertEqual(call.kwargs, {"weak": False, "dispatch_uid": "clean_titles_fresh_before_vod_scan"})
 
     def test_skip_list_is_kept_per_rule(self):
         with tempfile.TemporaryDirectory() as folder:

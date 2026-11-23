@@ -26,7 +26,7 @@ Or download the `clean_titles-<version>.zip` from Releases and import it on the 
 ## Notes
 
 - Titles without a TMDB ID are never renamed by name, because that would create duplicates on the next VOD refresh. Instead Rename Run searches TMDB for them and saves the ID when exactly one title has that name (and year). Searches are cached, so later runs need almost no lookups.
-- A VOD scan finds titles without a provider ID by their provider name only, so on its own it would make a new copy, with a new ID, of every title renamed or given an ID here. The plugin tells the scan which title each known stream already belongs to, so IDs (and players' watch progress) stay the same across scans.
+- A VOD scan finds titles without a provider ID by their provider name only, so on its own it would make a new copy, with a new ID, of every title renamed or given an ID here. The plugin tells the scan which title each known stream already belongs to, so IDs (and players' watch progress) stay the same across scans. Each scan first loads the newest plugin code in the worker that runs it. Worker processes started before 2.3.2 was installed don't do that yet: restart Dispatcharr's Celery worker (or the container) once after updating from an older version.
 
 ## Drag and search
 

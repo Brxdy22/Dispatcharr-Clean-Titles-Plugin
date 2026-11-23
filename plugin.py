@@ -2907,6 +2907,45 @@ except Exception:  # noqa: BLE001 - the plugin still loads; scans run unpatched
     logging.getLogger(LOGGER_NAME).exception("Could not patch the VOD scan")
 
 
+# A Celery worker process keeps the plugin code it loaded when it started or last ran a
+# plugin action. Dispatcharr's VOD scan task never checks for a newer plugin, so a scan
+# that lands on such a process ran with the old code (no patch above): an update or reload
+# did not reach it. Before each VOD scan, this asks Dispatcharr to load the newest plugin
+# code in that process (a cheap file-time check when nothing changed), which re-runs the
+# patch above. Kept small and self-contained: the first copy connected in a process stays
+# connected there for its whole life, whatever version is loaded later.
+SCAN_TASK = "apps.vod.tasks.refresh_vod_content"
+
+
+def _fresh_plugins_before_scan(sender=None, task=None, **_kwargs):
+    try:
+        if getattr(task or sender, "name", None) != SCAN_TASK:
+            return
+        from apps.plugins.loader import PluginManager
+
+        manager = PluginManager.get()
+        seen = getattr(manager, "_last_reload_token", None)
+        manager.discover_plugins(sync_db=False, use_cache=True, release_connections=False)
+        if getattr(manager, "_last_reload_token", None) != seen:
+            logging.getLogger(LOGGER_NAME).info("VOD scan: loaded the newest plugin code first")
+    except Exception:  # noqa: BLE001 - never stand in the way of a scan
+        logging.getLogger(LOGGER_NAME).exception("Could not check for newer plugin code before a VOD scan")
+
+
+def _hook_vod_scan():
+    from celery.signals import task_prerun
+
+    task_prerun.connect(_fresh_plugins_before_scan, weak=False, dispatch_uid="clean_titles_fresh_before_vod_scan")
+
+
+try:
+    _hook_vod_scan()
+except ImportError:  # outside Dispatcharr, as in the tests
+    pass
+except Exception:  # noqa: BLE001
+    logging.getLogger(LOGGER_NAME).exception("Could not hook the VOD scan")
+
+
 # --- drag and search ----------------------------------------------------------
 # Dispatcharr's multi-select can't be sorted or searched, and plugins have no way to add to
 # the settings page. Its page is rendered by this same Python process, so the browser code

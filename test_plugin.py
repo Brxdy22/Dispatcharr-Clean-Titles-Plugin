@@ -568,6 +568,8 @@ class FindIds(unittest.TestCase):
         plugin = p.Plugin()
         plugin.state = mock.Mock()
         plugin.state.busy.return_value = False
+        plugin.state.dir = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, plugin.state.dir, True)
         order = []
         account = mock.Mock(id=33)
         account.name = "Provider"
@@ -691,6 +693,94 @@ class FindIds(unittest.TestCase):
         self.assertTrue(actions["rename_run"]["async"])
         self.assertIn("finds TMDB IDs", actions["rename_run"]["description"])
         self.assertEqual(p.MARK, "imdb_titles")
+
+
+class StableIds(unittest.TestCase):
+    """VOD scans keep the title a known stream belongs to, and skip removed streams."""
+
+    class Movie:  # the lookup goes by the model's name
+        pass
+
+    def lookup(self, found, pins):
+        original = mock.Mock(return_value=dict(found))
+        wrapped = p._wrap_lookup(original)
+        p._PINS.rows = pins
+        self.addCleanup(setattr, p._PINS, "rows", None)
+        return wrapped, original
+
+    def test_a_miss_gets_the_title_its_stream_belongs_to(self):
+        renamed = object()
+        wrapped, original = self.lookup({}, {"Movie": {("EN - Movie Title (2024)", ""): {7: renamed}}})
+        out = wrapped(self.Movie, [("EN - Movie Title (2024)", 2024, "")])
+        self.assertIs(out[("EN - Movie Title (2024)", 2024, "")], renamed)
+        original.assert_called_once()
+
+    def test_dispatcharrs_own_match_wins(self):
+        own, renamed = object(), object()
+        key = ("Movie Title", 2024, "")
+        wrapped, _o = self.lookup({key: own}, {"Movie": {("Movie Title", ""): {7: renamed}}})
+        self.assertIs(wrapped(self.Movie, [key])[key], own)
+
+    def test_two_titles_for_one_name_or_another_language_are_left_to_dispatcharr(self):
+        wrapped, _o = self.lookup({}, {"Movie": {("Movie Title", ""): {7: object(), 8: object()},
+                                                 ("Other Title", "de"): {9: object()}}})
+        self.assertEqual(wrapped(self.Movie, [("Movie Title", 2024, ""), ("Other Title", 2024, "")]), {})
+
+    def test_no_pins_outside_a_batch(self):
+        wrapped, _o = self.lookup({}, None)
+        self.assertEqual(wrapped(self.Movie, [("Movie Title", 2024, "")]), {})
+
+    def test_a_failing_batch_preparation_still_runs_the_scan_unchanged(self):
+        original = mock.Mock(return_value="done")
+        wrapped = p._wrap_batch("movie", original)
+        batch = [{"stream_id": 1, "name": "Movie Title"}]
+        with mock.patch.object(p, "_prepare_batch", side_effect=RuntimeError("boom")), \
+                self.assertLogs(p.LOGGER_NAME, "ERROR"):
+            self.assertEqual(wrapped("account", batch, {}, {}), "done")
+        original.assert_called_once_with("account", batch, {}, {})
+        self.assertIsNone(p._PINS.rows)
+
+    def test_pins_are_cleared_after_each_batch(self):
+        def prepare(ctype, account, batch):
+            p._PINS.rows = {"Movie": {}}
+            return batch[:1]
+        seen = []
+        original = mock.Mock(side_effect=lambda a, b, *x: seen.append((b, p._PINS.rows)))
+        with mock.patch.object(p, "_prepare_batch", side_effect=prepare):
+            p._wrap_batch("movie", original)("account", [1, 2], {}, {})
+        self.assertEqual(seen, [([1], {"Movie": {}})])
+        self.assertIsNone(p._PINS.rows)
+
+    def test_patching_twice_wraps_dispatcharrs_original_once(self):
+        tasks = mock.Mock(spec=["lookup_by_name_year", "process_movie_batch", "process_series_batch"])
+        originals = {n: (lambda *a, **k: None) for n in ("lookup_by_name_year", "process_movie_batch", "process_series_batch")}
+        for name, original in originals.items():
+            setattr(tasks, name, original)
+        vod = mock.Mock(tasks=tasks)
+        with mock.patch.dict("sys.modules", {"apps": mock.Mock(vod=vod), "apps.vod": vod, "apps.vod.tasks": tasks}):
+            p._patch_vod_scan()
+            p._patch_vod_scan()  # a plugin reload
+        for name, original in originals.items():
+            self.assertIs(getattr(tasks, name).clean_titles_original, original)
+
+    def test_skip_list_is_kept_per_rule(self):
+        with tempfile.TemporaryDirectory() as folder:
+            plugin = p.Plugin()
+            plugin.state = temp_state(folder)
+            settings = {"language": "en-US", "keep_anime": True}
+            with mock.patch.object(p, "_data_dir", return_value=folder):
+                skips = plugin._language_skips_for(settings)
+                skips["movie"]["3:100"] = ["XX - Movie Title", 1]
+                plugin._save_language_skips(skips)
+                self.assertEqual(plugin._language_skips_for(settings)["movie"], {"3:100": ["XX - Movie Title", 1]})
+                self.assertEqual(plugin._language_skips_for(dict(settings, keep_anime=False))["movie"], {})
+                plugin._clear_language_skips()
+                self.assertEqual(p._language_skips(), {})
+
+    def test_language_rule_matches_the_filter(self):
+        self.assertEqual(p._language_rule({"language": "en-GB", "keep_anime": False}), ["en", False])
+        self.assertEqual(p._language_rule({}), [p.Plugin._default("language").split("-")[0].lower(),
+                                                bool(p.Plugin._default("keep_anime"))])
 
 
 if __name__ == "__main__":

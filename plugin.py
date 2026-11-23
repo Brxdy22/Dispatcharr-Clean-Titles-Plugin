@@ -13,8 +13,9 @@ Safe by design:
 - Only titles that have a TMDB ID are touched. Dispatcharr's VOD refresh matches
   those rows by TMDB ID, never by name, and never writes the name of an existing
   row back, so a rename survives refreshes and creates no duplicates. Titles
-  without a TMDB ID are matched by name+year during refresh, so renaming them
-  would create duplicates: they are left alone.
+  without a TMDB ID are matched by name+year during refresh, so a title this
+  plugin renamed or gave an ID would be made again with a new ID: the refresh is
+  told which title each known stream already belongs to (see "stable IDs").
 - The provider's original name is kept in custom_properties["imdb_titles"], so
   Revert All puts everything back.
 - A rename that would collide with another row (same name, year and language,
@@ -1213,6 +1214,8 @@ class Plugin:
             messages.append(self._group_categories(settings, notify=False)["message"])
             if settings.get("language_filter"):  # before renaming, so removed titles aren't renamed first
                 messages.append(self._language_filter(settings, remove=True, notify=False)["message"])
+            else:
+                self._clear_language_skips()  # off: removed titles come back from the next scan on
             messages.append(self._fix_images(settings, notify=False, account=account)["message"])
             if has_key and found_ids.get("stopped"):
                 messages.append(f"{account.name}: stopped while finding TMDB IDs; not renamed.")
@@ -2418,12 +2421,19 @@ class Plugin:
                 st["languages"] = languages.most_common(10)
                 st["samples"] = [f"{r[2]} ({r[1]})" for r in report[:: max(1, len(report) // 10)][:10]]
                 if remove and not dry and not st.get("refused"):
-                    for ctype, pks in gone.items():
-                        model = vm.Movie if ctype == "movie" else vm.Series
-                        for i in range(0, len(pks), 500):
-                            with transaction.atomic():
-                                model.objects.filter(id__in=pks[i:i + 500]).delete()
-                            self.state.write(st)
+                    skips = self._language_skips_for(settings)
+                    try:
+                        for ctype, pks in gone.items():
+                            model = vm.Movie if ctype == "movie" else vm.Series
+                            for i in range(0, len(pks), 500):
+                                with transaction.atomic():
+                                    streams = self._streams_of(ctype, pks[i:i + 500])
+                                    model.objects.filter(id__in=pks[i:i + 500]).delete()
+                                skips[ctype].update(streams)  # only once the delete has committed
+                                self.state.write(st)
+                    finally:
+                        self._save_language_skips(skips)
+                    st["skip_list"] = sum(len(skips[c]) for c in ("movie", "series"))
                     st["done"] = True
         except Exception as exc:  # noqa: BLE001
             log.exception("Language filter failed")
@@ -2438,6 +2448,43 @@ class Plugin:
         if notify or st.get("refused") or st.get("failed"):
             self._notify(summary, bool(st.get("refused") or st.get("failed")), title="Clean Titles: language filter")
         return {"status": "ok", "message": summary}
+
+    def _language_skips_for(self, settings):
+        """The skip list for the current rule (a list made under another rule starts over)."""
+        data = _language_skips()
+        rule = _language_rule(settings)
+        if data.get("rule") != rule:
+            data = {}
+        return {"rule": rule, "movie": dict(data.get("movie") or {}), "series": dict(data.get("series") or {})}
+
+    def _save_language_skips(self, skips):
+        path = os.path.join(self.state.dir, LANG_SKIP)
+        with open(path + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(skips, f)
+        os.replace(path + ".tmp", path)
+
+    def _clear_language_skips(self):
+        path = os.path.join(self.state.dir, LANG_SKIP)
+        if os.path.exists(path):
+            os.remove(path)
+
+    @staticmethod
+    def _streams_of(ctype, pks):
+        """{"account:stream": [provider name, time]} for the streams of these titles, so the
+        next scans skip them instead of adding the titles back with new IDs."""
+        from apps.vod import models as vm
+
+        model_name, rel_name, fk, _item_id, rel_id = _SCAN_KINDS[ctype]
+        max_length = getattr(vm, model_name)._meta.get_field("name").max_length
+        now = int(time.time())
+        out = {}
+        for account_id, sid, cp in (getattr(vm, rel_name).objects.filter(**{f"{fk}_id__in": pks})
+                                    .values_list("m3u_account_id", rel_id, "custom_properties")):
+            basic = (cp or {}).get("basic_data") if isinstance(cp, dict) else None
+            name = _provider_name((basic or {}).get("name"), max_length)
+            if name:
+                out[f"{account_id}:{sid}"] = [name, now]
+        return out
 
     def _revert_groups(self):
         import logging
@@ -2587,6 +2634,8 @@ class Plugin:
                 lines.append("Examples: " + "; ".join(st["samples"]))
             if st.get("report"):
                 lines.append(f"Full list: {st['report']}")
+            if st.get("skip_list"):
+                lines.append(f"{st['skip_list']} removed streams are skipped by VOD scans, so they don't come back.")
             for key in ("refused", "error", "failed"):
                 if st.get(key):
                     lines.append(st[key])
@@ -2696,6 +2745,166 @@ class Plugin:
             send_websocket_notification(n)
         except Exception as exc:  # noqa: BLE001 - a notification must never fail the run
             logging.getLogger(LOGGER_NAME).warning("Could not send the notification: %s", exc)
+
+
+# --- stable IDs across VOD scans -------------------------------------------------
+# A VOD scan finds the title of a provider row with no TMDB/IMDb ID by its exact name and
+# year among titles that also have no ID (lookup_by_name_year). A title this plugin renamed,
+# gave an ID or joined to another is not found that way, so the scan made a new title, moved
+# the stream to it and deleted the old one: a new ID each scan, for every such title. Here the
+# scan is told the title the stream already belongs to (its own relation), as long as the
+# provider still calls it the same thing. Titles the language filter removed stay away: the
+# scan skips their streams instead of adding them back. Anything unexpected leaves the scan
+# exactly as Dispatcharr wrote it.
+_PINS = threading.local()
+LANG_SKIP = "language_skip.json"
+_CONFIG = {"at": 0.0, "value": None}
+_SKIP = {"mtime": None, "data": {}}
+
+
+def _data_dir():
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "imdb_titles_data")
+
+
+def _plugin_config():
+    """(enabled, settings), read at most every 30 seconds (a scan runs many batches)."""
+    now = time.monotonic()
+    if _CONFIG["value"] is None or now - _CONFIG["at"] > 30:
+        from apps.plugins.models import PluginConfig
+
+        row = PluginConfig.objects.filter(key="clean_titles").values_list("enabled", "settings").first()
+        _CONFIG.update(at=now, value=(bool(row and row[0]), (row[1] if row else None) or {}))
+    return _CONFIG["value"]
+
+
+def _language_rule(settings):
+    """What a removal was decided under: entries made under another rule are not used."""
+    lang = (settings.get("language") or Plugin._default("language") or "en-US").split("-")[0].strip().lower()
+    return [lang, bool(settings.get("keep_anime", Plugin._default("keep_anime")))]
+
+
+def _language_skips():
+    """{"rule": [...], "movie": {"account:stream": [name, at]}, "series": {...}}, cached by mtime."""
+    path = os.path.join(_data_dir(), LANG_SKIP)
+    try:
+        mtime = os.stat(path).st_mtime_ns
+    except OSError:
+        return {}
+    if _SKIP["mtime"] != mtime:
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            data = {}
+        _SKIP.update(mtime=mtime, data=data if isinstance(data, dict) else {})
+    return _SKIP["data"]
+
+
+def _provider_name(value, max_length):
+    """The name exactly as Dispatcharr's scan keys it."""
+    return str(value or "").strip()[:max_length]
+
+
+_SCAN_KINDS = {"movie": ("Movie", "M3UMovieRelation", "movie", "stream_id", "stream_id"),
+               "series": ("Series", "M3USeriesRelation", "series", "series_id", "external_series_id")}
+
+
+def _prepare_batch(ctype, account, batch):
+    """The batch without the language filter's streams; pins this batch's known streams."""
+    from apps.vod import models as vm
+
+    enabled, settings = _plugin_config()
+    if not enabled or not batch:
+        return batch
+    model_name, rel_name, fk, item_id, rel_id = _SCAN_KINDS[ctype]
+    model, rel_model = getattr(vm, model_name), getattr(vm, rel_name)
+    max_length = model._meta.get_field("name").max_length
+    skips = _language_skips() if settings.get("language_filter") else {}
+    gone = (skips.get(ctype) or {}) if skips.get("rule") == _language_rule(settings) else {}
+    kept, names = [], {}
+    for data in batch:
+        sid = str(data.get(item_id))
+        name = _provider_name(data.get("name"), max_length)
+        entry = gone.get(f"{account.id}:{sid}")
+        if entry and entry[0] == name:
+            continue  # removed by the language filter: not added back
+        kept.append(data)
+        names[sid] = name
+    pins = {}
+    ids = list(names)
+    for i in range(0, len(ids), 2000):
+        for rel in rel_model.objects.filter(m3u_account=account, **{f"{rel_id}__in": ids[i:i + 2000]}).select_related(fk):
+            row = getattr(rel, fk)
+            name = names.get(str(getattr(rel, rel_id)))
+            before = ((rel.custom_properties or {}).get("basic_data") or {}) if isinstance(rel.custom_properties, dict) else {}
+            if not name or _provider_name(before.get("name"), max_length) != name:
+                continue  # new, or the provider renamed it: Dispatcharr decides
+            if not row.tmdb_id and not row.imdb_id and row.name == name:
+                continue  # Dispatcharr finds this one itself
+            cp = row.custom_properties if isinstance(row.custom_properties, dict) else {}
+            if MARK not in cp and not row.tmdb_id and not row.imdb_id:
+                continue  # not changed by this plugin
+            pins.setdefault((name, row.language), {})[row.pk] = row
+    if pins or len(kept) < len(batch):
+        logging.getLogger(LOGGER_NAME).info("VOD scan batch: %d known %s titles kept their IDs, %d removed streams skipped",
+                                            sum(len(r) for r in pins.values()), ctype, len(batch) - len(kept))
+    _PINS.rows = {model_name: pins}
+    return kept
+
+
+def _wrap_batch(ctype, original):
+    def process_batch(account, batch, *args, **kwargs):
+        _PINS.rows = None
+        try:
+            batch = _prepare_batch(ctype, account, batch)
+        except Exception:  # noqa: BLE001 - never stand in the way of a scan
+            _PINS.rows = None
+            logging.getLogger(LOGGER_NAME).exception("Stable IDs: batch left as Dispatcharr wrote it")
+        try:
+            return original(account, batch, *args, **kwargs)
+        finally:
+            _PINS.rows = None
+
+    process_batch.clean_titles_original = original
+    process_batch.__name__ = getattr(original, "__name__", "process_batch")
+    return process_batch
+
+
+def _wrap_lookup(original):
+    def lookup_by_name_year(model, name_year_language_keys):
+        found = original(model, name_year_language_keys)
+        try:
+            pins = (getattr(_PINS, "rows", None) or {}).get(model.__name__)
+            if pins:
+                for key in set(name_year_language_keys):
+                    rows = pins.get((key[0], key[2]))
+                    if key not in found and rows and len(rows) == 1:
+                        found[key] = next(iter(rows.values()))
+        except Exception:  # noqa: BLE001
+            logging.getLogger(LOGGER_NAME).exception("Stable IDs: lookup left as Dispatcharr wrote it")
+        return found
+
+    lookup_by_name_year.clean_titles_original = original
+    return lookup_by_name_year
+
+
+def _patch_vod_scan():
+    """Wraps Dispatcharr's originals (never an earlier wrap), so a reload replaces the patch."""
+    from apps.vod import tasks as vt
+
+    for attr, wrap in (("lookup_by_name_year", _wrap_lookup),
+                       ("process_movie_batch", lambda o: _wrap_batch("movie", o)),
+                       ("process_series_batch", lambda o: _wrap_batch("series", o))):
+        current = getattr(vt, attr)
+        setattr(vt, attr, wrap(getattr(current, "clean_titles_original", current)))
+
+
+try:
+    _patch_vod_scan()
+except ImportError:  # outside Dispatcharr, as in the tests
+    pass
+except Exception:  # noqa: BLE001 - the plugin still loads; scans run unpatched
+    logging.getLogger(LOGGER_NAME).exception("Could not patch the VOD scan")
 
 
 # --- drag and search ----------------------------------------------------------

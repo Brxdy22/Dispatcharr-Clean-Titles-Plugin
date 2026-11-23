@@ -1,6 +1,6 @@
 {
   "name": "Clean Titles",
-  "version": "2.3.0",
+  "version": "2.3.1",
   "description": "Renames VOD movies and series in the catalogue to their official titles, looked up by each title's TMDB ID. Removes provider prefixes and tags like 'EN - ... (US)'. Keeps each original name so every rename can be reverted. Can also replace the providers' many categories with the streaming services you select (Netflix, Disney+, Tubi...). Dry run by default. This product uses the TMDB API but is not endorsed or certified by TMDB.",
   "author": "Brxdy22",
   "license": "MIT",
@@ -62,7 +62,7 @@
       "label": "Clean titles with no TMDB ID",
       "type": "boolean",
       "default": false,
-      "help_text": "After each VOD scan, joins these titles to a matching title that has an ID, looks them up on TMDB by exact name and year, or removes the provider prefix. Scans add them back under the provider's name, so they get new IDs each scan, and players may lose their place in them."
+      "help_text": "After each VOD scan, joins these titles to a matching title that has an ID, looks them up on TMDB by exact name and year, or removes the provider prefix. A joined or cleaned title keeps its ID through later scans while the provider keeps its name."
     },
     {
       "id": "language",
@@ -218,7 +218,7 @@
       "label": "Remove titles in other languages",
       "type": "boolean",
       "default": false,
-      "help_text": "Deletes titles whose original and spoken languages on TMDB don't include the Title language, after each VOD scan. Dispatcharr can't hide titles, and a scan brings them back for a moment until this runs. Titles TMDB has no language for are kept. Use Preview Language Filter first. Turning this off and refreshing the account brings them back, with new IDs."
+      "help_text": "Deletes titles whose original and spoken languages on TMDB don't include the Title language, after each VOD scan. Dispatcharr can't hide titles, so later scans skip the removed streams instead of adding them back. Titles TMDB has no language for are kept. Use Preview Language Filter first. Turning this off and refreshing the account brings them back."
     },
     {
       "id": "keep_anime",

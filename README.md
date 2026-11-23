@@ -21,11 +21,12 @@ Or download the `clean_titles-<version>.zip` from Releases and import it on the 
 3. Original names are kept, so **Revert All Renames** puts everything back.
 4. Pick your services in **Select Streaming Services to Use + Priority**, then run **Apply Streaming Categories**. **Revert Streaming Categories** puts titles back in their provider categories.
 5. Titles only for rent or sale go to their own category, **Rent/Buy** by default.
-6. To remove titles in other languages, run **Preview Language Filter**, turn on **Remove titles in other languages**, then press **Remove**. It deletes titles, because Dispatcharr can't hide them, and runs again after each VOD scan. Turning it off and refreshing the account brings them back with new IDs.
+6. To remove titles in other languages, run **Preview Language Filter**, turn on **Remove titles in other languages**, then press **Remove**. It deletes titles, because Dispatcharr can't hide them, and runs again after each VOD scan. Later scans skip the removed streams, so they don't come back. Turning it off and refreshing the account brings them back with new IDs.
 
 ## Notes
 
-- Titles without a TMDB ID are never renamed by name, because that would create duplicates on the next VOD refresh. Instead Rename Run searches TMDB for them and saves the ID when exactly one title has that name (and year). Searches are cached, so later runs, and the runs after each VOD scan (which drops these IDs), need almost no lookups.
+- Titles without a TMDB ID are never renamed by name, because that would create duplicates on the next VOD refresh. Instead Rename Run searches TMDB for them and saves the ID when exactly one title has that name (and year). Searches are cached, so later runs need almost no lookups.
+- A VOD scan finds titles without a provider ID by their provider name only, so on its own it would make a new copy, with a new ID, of every title renamed or given an ID here. The plugin tells the scan which title each known stream already belongs to, so IDs (and players' watch progress) stay the same across scans.
 
 ## Drag and search
 

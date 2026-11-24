@@ -470,6 +470,13 @@ class Plugin:
                                      .values_list("id", "name", "year", "language")):
             linked.setdefault((self._same_title_key(name), year, lang or ""), []).append(pk)
             named.setdefault(((name or "").strip().casefold(), lang or ""), []).append(pk)
+        try:  # also its other names ("Code Name: Show" for "Show")
+            for pk, _tmdb_id, name, year, lang in self._stored_names(ctype):
+                pks = linked.setdefault((self._same_title_key(name), year, lang), [])
+                if pk not in pks:
+                    pks.append(pk)
+        except Exception as exc:  # noqa: BLE001 - joins by current names only
+            log.warning("Known names not read: %s", self._safe_error(exc))
         for row, title, year in loose:
             if year:
                 matches = linked.get((self._same_title_key(title), year, row.language or ""), [])
@@ -623,6 +630,63 @@ class Plugin:
         return [str(hit["id"]), hit.get("title") or hit.get("name") or "",
                 int(date[:4]) if date[:4].isdigit() else None, hit.get("poster_path")]
 
+    _KINDS = {"movie": ("Movie", "M3UMovieRelation", "movie"), "series": ("Series", "M3USeriesRelation", "series")}
+
+    def _stored_names(self, ctype):
+        """(pk, tmdb id, title, year, language) for each name a title with an ID is known by: its
+        original and clean names kept under MARK and each provider's name for it, cleaned like a
+        search name. A provider may name a title the way TMDB once did ("Code Name: Show"),
+        so a title with no ID of that name and year is that title. Only names other than the title's
+        own name: TMDB, or the plugin's join by name, already covers that one, and a same-named
+        title of that year may be a different film. Names with no year are left out."""
+        from django.db.models import Q
+        from django.db.models.fields.json import KT
+        from apps.vod import models as vm
+
+        model_name, rel_name, fk = self._KINDS[ctype]
+        model, rel = getattr(vm, model_name), getattr(vm, rel_name)
+        has_id = Q(tmdb_id__isnull=False) & ~Q(tmdb_id="") | Q(imdb_id__isnull=False) & ~Q(imdb_id="")
+        rows = {}
+        for pk, own, tmdb_id, year, lang, cp in model.objects.filter(has_id).values_list(
+                "id", "name", "tmdb_id", "year", "language", "custom_properties").iterator(chunk_size=5000):
+            rows[pk] = (tmdb_id or None, year, lang or "", self._same_title_key((self._search_name(own) or (own,))[0]))
+            mark = cp.get(MARK) if isinstance(cp, dict) else None
+            if isinstance(mark, dict):
+                for name in {mark.get("original_name"), mark.get("base_name")} - {None, ""}:
+                    yield from self._stored_name(pk, rows[pk], name)
+        prefix = f"{fk}__"
+        has_id = Q(**{prefix + "tmdb_id__isnull": False}) & ~Q(**{prefix + "tmdb_id": ""}) | \
+            Q(**{prefix + "imdb_id__isnull": False}) & ~Q(**{prefix + "imdb_id": ""})
+        for pk, name in (rel.objects.filter(has_id).annotate(provider_name=KT("custom_properties__basic_data__name"))
+                         .values_list(f"{fk}_id", "provider_name").iterator(chunk_size=5000)):
+            if pk in rows and name:
+                yield from self._stored_name(pk, rows[pk], name)
+
+    def _stored_name(self, pk, row, name):
+        cleaned = self._search_name(name)
+        year = cleaned and (cleaned[1] or row[1])
+        if year and self._same_title_key(cleaned[0]) != row[3]:
+            yield pk, row[0], cleaned[0], year, row[2]
+
+    def _known_ids(self, scope):
+        """{search key: [TMDB id, title, year, None]} for names that belong to exactly one TMDB ID
+        already in the catalogue (see _stored_names). Checked before TMDB is searched, so a title
+        TMDB has renamed since still finds its ID. Empty if the catalogue can't be read."""
+        ids = {}
+        try:
+            for ctype in ("movie", "series"):
+                if scope not in ("both", "movies" if ctype == "movie" else "series"):
+                    continue
+                for _pk, tmdb_id, title, year, _lang in self._stored_names(ctype):
+                    if tmdb_id:
+                        ids.setdefault(self._id_key(ctype, title, year), {})[str(tmdb_id)] = (title, year)
+        except Exception as exc:  # noqa: BLE001 - TMDB is searched as before
+            logging.getLogger(LOGGER_NAME).warning("Known names not read: %s", self._safe_error(exc))
+            return {}
+        finally:
+            _release_db_connections()
+        return {k: [tid, *v[tid], None] for k, v in ids.items() if len(v) == 1 for tid in v}
+
     def _id_cache(self, cache=None):
         """Reads the search cache, or with cache writes it: {key: [match or None, time]}."""
         path = os.path.join(self.state.dir, self.ID_CACHE)
@@ -731,6 +795,10 @@ class Plugin:
                 by_key.setdefault(self._id_key(c[0], c[2], c[3]), []).append(c)
             st["total"] = len(cands)
             keys = list(by_key)
+            known = self._known_ids(settings.get("scope") or "both") if keys else {}
+            known = {k: known[k] for k in keys if k in known}
+            if known:
+                log.info("Find IDs: %d names already belong to a title with an ID", len(known))
             limiter = _RateLimiter(settings.get("requests_per_second") or 20)
             session = requests.Session()
             log.info("Find IDs started: %d titles with no ID (%d names)%s%s", len(cands), len(keys),
@@ -738,7 +806,7 @@ class Plugin:
             for i in range(0, len(keys), self.ID_CHUNK):
                 chunk = keys[i:i + self.ID_CHUNK]
                 now = time.time()
-                todo = [k for k in chunk if not self._id_fresh(cache.get(k), now)]
+                todo = [k for k in chunk if k not in known and not self._id_fresh(cache.get(k), now)]
                 if todo:
                     with ThreadPoolExecutor(max_workers=4) as pool:
                         futures = {pool.submit(self._find_id, session, key, by_key[k][0][0], by_key[k][0][2],
@@ -762,10 +830,10 @@ class Plugin:
                     break
                 hits = []
                 for k in chunk:
-                    match = (cache.get(k) or [None])[0]
+                    match = (cache.get(k) or [None])[0] or known.get(k)
                     for c in by_key[k]:
                         st["processed"] += 1
-                        if k not in cache:
+                        if k not in cache and k not in known:
                             continue  # the search failed: tried again next run
                         if match is None:
                             st["no_match"] += 1

@@ -497,7 +497,7 @@ class FindIds(unittest.TestCase):
         self.assertNotIn("SECRETKEY", p.Plugin._safe_error(exc))
         self.assertIn("500", p.Plugin._safe_error(exc))
 
-    def run_find(self, folder, cands, answers, sample=False, dry=False, stop_after=None):
+    def run_find(self, folder, cands, answers, sample=False, dry=False, stop_after=None, known=None):
         plugin = p.Plugin()
         plugin.state = temp_state(folder)
         calls = []
@@ -512,6 +512,7 @@ class FindIds(unittest.TestCase):
         settings = {"tmdb_api_key": "k", "dry_run": dry, "requests_per_second": 1000}
         with mock.patch.dict("sys.modules", fake_django()), \
                 mock.patch.object(plugin, "_id_candidates", return_value=cands), \
+                mock.patch.object(plugin, "_known_ids", return_value=known or {}), \
                 mock.patch.object(p.Plugin, "_find_id", side_effect=find_id), \
                 mock.patch.object(plugin, "_save_found_id", side_effect=lambda c, pk, t, st: saved.append((pk, t))), \
                 mock.patch.object(p.time, "sleep"):
@@ -535,6 +536,39 @@ class FindIds(unittest.TestCase):
             _r, calls, saved, _p = self.run_find(folder, self.CANDS, answers)
             self.assertEqual(calls, [])  # all from the cache, the miss included
             self.assertEqual(len(saved), 2)
+
+    def test_a_name_known_from_a_title_with_an_id_skips_tmdb(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with open(os.path.join(folder, p.Plugin.ID_CACHE), "w", encoding="utf-8") as f:
+                json.dump({"series:seriestitle:2020": [None, __import__("time").time()]}, f)  # TMDB renamed it
+            known = {"series:seriestitle:2020": ["77", "Series Title", 2020, None]}
+            _r, calls, saved, plugin = self.run_find(folder, self.CANDS, {}, known=known)
+            self.assertNotIn(("series", "Series Title", 2020), calls)
+            self.assertEqual(saved, [(3, "77")])
+            with open(os.path.join(folder, p.Plugin.ID_CACHE), encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["series:seriestitle:2020"][0], None)  # the cache stays TMDB's
+
+    def test_known_ids_keep_only_names_of_one_id(self):
+        plugin = p.Plugin()
+        rows = {"series": [(1, "10", "Code Name: Show", 2023, ""), (1, "10", "Show", 2023, ""),
+                           (2, "20", "Twin", 2020, ""), (3, "30", "Twin", 2020, ""), (4, None, "Only Imdb", 2020, "")],
+                "movie": []}
+        with mock.patch.dict("sys.modules", fake_django()), \
+                mock.patch.object(plugin, "_stored_names", side_effect=lambda c: iter(rows[c])):
+            known = plugin._known_ids("both")
+        self.assertEqual(known, {"series:codenameshow:2023": ["10", "Code Name: Show", 2023, None],
+                                 "series:show:2023": ["10", "Show", 2023, None]})
+
+    def test_stored_name_is_cleaned_and_needs_a_year(self):
+        plugin = p.Plugin()
+        self.assertEqual(list(plugin._stored_name(5, ("10", None, "", "show"), "EN - Code Name: Show (2023) (US)")),
+                         [(5, "10", "Code Name: Show", 2023, "")])
+        self.assertEqual(list(plugin._stored_name(5, ("10", 2021, "", "x"), "Show")), [(5, "10", "Show", 2021, "")])
+        self.assertEqual(list(plugin._stored_name(5, ("10", None, "", "x"), "Show")), [])  # no year
+
+    def test_stored_name_skips_the_titles_own_name(self):
+        plugin = p.Plugin()
+        self.assertEqual(list(plugin._stored_name(5, ("10", 2019, "", "movietitle"), "EN - Movie Title (2019) (US)")), [])
 
     def test_dry_run_saves_nothing(self):
         with tempfile.TemporaryDirectory() as folder:
